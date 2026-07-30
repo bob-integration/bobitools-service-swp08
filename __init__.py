@@ -94,8 +94,37 @@ ESSENCE_LABELS = {"video": "vidéo", "audio1": "audio 1", "audio2": "audio 2",
 STAGE_LABELS = {"in": "entrées", "out": "sorties", "assign": "affectation",
                 "test": "banc d'essai"}
 
+# Suffixe d'essence ajouté au libellé. RIEN pour la vidéo : c'est l'essence par défaut, celle
+# qu'on regarde neuf fois sur dix, et l'alourdir gaspillerait des caractères sur les douze que
+# le protocole accorde. Les autres se signalent, sinon rien ne distingue le layer où on se
+# trouve — le nom d'un signal, lui, ne dépend pas de l'essence qu'on y regarde.
+#
+# Pourquoi « AU1 » et non « A1 » : les SNP et les Neuron nomment leurs voies « A1 »… « D8 » ou
+# « H4 », donc un suffixe « A1 » donnerait « SNP1 A1 A1 » — et « SNP1 A2 A2 » pour le canal A2
+# en audio 2, franchement trompeur. Et pas « Audio1 » non plus : six caractères sur douze
+# mangent le nom du canal, si bien que les 32 voies d'un SNP se liraient toutes « SNP1 Audio1 ».
+# Trois caractères sont le point d'équilibre — mesuré, pas supposé.
+ESSENCE_SUFFIX = {"video": "", "audio1": "AU1", "audio2": "AU2", "anc": "ANC", None: ""}
+
+
+def _suffixe(labels, essence, largeur):
+    """Ajoute le suffixe d'essence à un jeu de libellés, en tenant dans la largeur imposée.
+    On tronque le NOM et jamais le suffixe : perdre le suffixe rendrait deux layers
+    indiscernables, alors qu'un nom raccourci reste lisible."""
+    suf = ESSENCE_SUFFIX.get(essence) or ""
+    if not suf:
+        return labels
+    garde = largeur - len(suf) - 1
+    # Les PSEUDO-signaux (bloc bas, 1..99 : « Disconnect », « Mire ») ne portent pas d'essence
+    # — ce sont des gestes, pas des flux. Les suffixer les tronquerait pour rien : le protocole
+    # ne laisse que douze caractères, et « Disconnec A1 » ne dit rien de plus que « Disconnect ».
+    return {n: (v if (n < 100 or not v)
+                else "%s %s" % (str(v)[:garde].rstrip(), suf))
+            for n, v in labels.items()}
+
 # niveau AFFICHÉ (base 1) → étage
 _STAGE_OF_LEVEL = {lvl: stage for lvl, stage, _ in LEVEL_PLAN}
+_ESSENCE_OF_LEVEL = {lvl: ess for lvl, _st, ess in LEVEL_PLAN}
 DEFAULT_STAGE = "in"        # un niveau hors plan retombe sur l'étage d'entrée
 
 _lock = threading.Lock()
@@ -370,7 +399,12 @@ def _build_model():
         # Voies : destinations de l'étage d'entrée, sources de l'étage de sortie.
         for lane in sorted(dev.get("lanes") or {}):
             num = ipg_io.lane_signal(slot, lane)
-            lbl = _format(lane_fmt, short=court, slot=slot, lane=lane,
+            # `{name}` = la désignation constructeur publiée par le matériel (« A1 » sur un
+            # SNP ou un Neuron). Repli sur « V<voie> » pour les familles qui n'en ont pas :
+            # un CDE ou un Newt ne nomment pas leurs voies, et il faut bien afficher quelque
+            # chose dans les 12 caractères du protocole.
+            nom = (dev.get("lanes") or {}).get(lane, {}).get("name") or ""
+            lbl = _format(lane_fmt, short=court, slot=slot, lane=lane, name=nom or "V%d" % lane,
                           index=num, kind="V", n=lane, label="")
             out[("in", "dest")][num] = lbl
             out[("out", "source")][num] = lbl
@@ -472,7 +506,8 @@ def responses_for(req, tables=None):
             return [], err
     etage = _stage_of(req["matrix"] + 1, req["level"] + 1)   # le fil est en base 0 (§10.3)
     role = "dest" if req["kind"] == "dest" else "source"
-    labels = tables.get((etage, role)) or {}
+    labels = _suffixe(tables.get((etage, role)) or {},
+                      _ESSENCE_OF_LEVEL.get(req["matrix"] + 1), label_chars())
     if not labels:
         return [], None
     data_list = proto.name_responses(
@@ -542,7 +577,8 @@ def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
             continue
         etage = _stage_of(layer)
         for kind, role in (("source", "source"), ("dest", "dest")):
-            labels = dict(tables.get((etage, role)) or {})
+            labels = _suffixe(dict(tables.get((etage, role)) or {}),
+                              _ESSENCE_OF_LEVEL.get(layer), label_chars())
             cle = (layer, kind)
             if clear_stale:
                 # Un matériel qui rétrécit ou s'en va laisse des numéros ORPHELINS : le SNP et
