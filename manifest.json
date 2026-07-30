@@ -1,0 +1,81 @@
+{
+  "license": "GPL-3.0-or-later",
+  "id": "swp08",
+  "label": "SW-P-08",
+  "version": "0.1.0",
+  "description": "Serveur SW-P-08 (Pro-Bel « General Remote Control Protocol ») — publie le parc IPG sous forme de routeur : noms de sources, de destinations et libellés UMD, par matrice et par niveau. Les essences (vidéo, audio 1, audio 2, ANC) sont les NIVEAUX du protocole, ce qui évite les treize récepteurs qu'il aurait fallu en TSL. Nous sommes le routeur, le pupitre est le client : il se connecte, demande, on répond. Sans authentification → à filtrer au niveau réseau.",
+  "settings_keys": {
+    "swp08_enabled": {
+      "type": "bool",
+      "default": false
+    },
+    "swp08_port": {
+      "type": "int",
+      "default": 0
+    },
+    "swp08_label_chars": {
+      "type": "int",
+      "default": 12
+    },
+    "swp08_matrix_in": {
+      "type": "int",
+      "default": 1
+    },
+    "swp08_matrix_out": {
+      "type": "int",
+      "default": 2
+    },
+    "swp08_extended": {
+      "type": "bool",
+      "default": true
+    },
+    "swp08_short_names": {
+      "type": "text",
+      "default": {}
+    },
+    "swp08_signal_format": {
+      "type": "text",
+      "default": "{short} {kind}{n}"
+    },
+    "swp08_lane_format": {
+      "type": "text",
+      "default": "{short} V{lane}"
+    },
+    "swp08_allow_assign": {
+      "type": "bool",
+      "default": true
+    },
+    "swp08_dual_status": {
+      "type": "int",
+      "default": 2
+    },
+    "swp08_test": {
+      "type": "bool",
+      "default": false
+    },
+    "swp08_test_matrix": {
+      "type": "int",
+      "default": 1
+    },
+    "swp08_push_names": {
+      "type": "bool",
+      "default": true
+    },
+    "swp08_sdi_per_slot": {
+      "type": "int",
+      "default": 40
+    },
+    "swp08_ip_per_slot": {
+      "type": "int",
+      "default": 32
+    },
+    "swp08_slot_format": {
+      "type": "text",
+      "default": "IPG{slot} - {n}"
+    },
+    "swp08_unused_label": {
+      "type": "text",
+      "default": "."
+    }
+  }
+}

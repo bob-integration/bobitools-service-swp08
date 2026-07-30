@@ -1,0 +1,1166 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 BOBI SAS, France
+# Auteur : Cyril Mazouer, pour le compte de BOBI SAS
+# Distribué sous licence GNU GPL v3 (ou ultérieure) ; voir le fichier LICENSE.
+
+"""Service SW-P-08 — Bobi.Tools se présente au pupitre comme un ROUTEUR nommé.
+
+Raison d'être. La grille Ember+ n'émet que des numéros (EMBERPLUS-IPG.md §12.9.1) et le TSL
+5.0, qui devait porter les noms, s'est révélé inapplicable ici : le récepteur visé n'expose pas
+la notion d'écran et n'offre qu'un espace PLAT de 1024 canaux, alors qu'il faut nommer les
+voies, les connecteurs des deux sens et les quatre essences — soit treize destinations réseau
+distinctes. SW-P-08 a nativement les deux dimensions qui manquaient.
+
+── La correspondance, et c'est tout le service ──────────────────────────────────────────
+    MATRICE = l'étage de routage          NIVEAU = l'essence
+      matrice « entrées » : sources = connecteurs d'entrée   destinations = voies
+      matrice « sorties » : sources = voies                  destinations = connecteurs de sortie
+      niveaux : 0 vidéo · 1 audio 1 · 2 audio 2 · 3 ANC
+
+C'est exactement la structure des grilles Ember+ (1011/1012 vidéo, 1013/1014 audio, 1015/1016
+ANC), transposée sans rien réinventer. Et surtout, sources et destinations sont deux espaces
+SÉPARÉS dans chaque matrice : le numéro 101 peut donc désigner le connecteur d'entrée 1 en
+source et la voie 1 en destination, comme du côté Ember+, sans le recouvrement qui condamnait
+le TSL.
+
+── Sens du flux ─────────────────────────────────────────────────────────────────────────
+Nous ÉCOUTONS (Appendix 2 de la spec : le serveur TCP est du côté routeur, le contrôleur est
+client, 16 clients simultanés au plus). Le pupitre demande, on répond. Aucune écriture vers du
+matériel n'est acceptée aujourd'hui : ce service ne fait que NOMMER — le routage reste sur
+Ember+, qui l'assure déjà et dont on ne veut pas deux sources de vérité.
+
+⚠ **Tout est en base 0 sur le fil.** Matrice, niveau, source et destination : la spec l'écrit
+noir sur blanc (« note all protocol data is based from zero ») avec un exemple où « Matrice 2,
+Niveau 2, Destination 3 » s'encode `11 00 02 00`. Les réglages, eux, sont en base 1 comme ce
+que lit l'exploitant — la conversion se fait ici et NULLE PART ailleurs. Même piège que le −1
+d'Ember+, même remède : un seul endroit qui décale.
+
+── Ce qui n'est pas vérifié ─────────────────────────────────────────────────────────────
+La couche liaison est validée contre les trames de la spec (cf. `swp08.py`). Les COMMANDES DE
+NOMS ne le sont pas : elles ne figurent dans aucune spec publique — l'Issue 4b s'arrête aux
+« main commands » — et viennent du module Companion `generic-swp08`. Leur disposition exacte
+est donc à confronter au banc, ce à quoi sert la prévisualisation hexadécimale commentée.
+"""
+import logging
+import socket
+import threading
+import time
+
+from app import settings, tools
+from app.database import audit_log
+from . import swp08 as proto
+
+log = logging.getLogger(__name__)
+
+SWP08_ACTOR = "Service SW-P-08"
+
+MAX_CLIENTS = 16          # plafond de la spec (Appendix 2)
+ACCEPT_TIMEOUT_S = 1.0
+CLIENT_IDLE_S = 300
+
+# ── Plan des niveaux — LE CONTRAT ────────────────────────────────────────────────────────
+# Un niveau par couple (essence, direction), puis l'affectation. L'ordre EST le contrat : le
+# changer renomme tout au pupitre, exactement comme renuméroter une racine Ember+.
+#
+# Pourquoi la DIRECTION mérite un niveau alors que l'essence n'y change rien. Le nom d'un
+# connecteur ne dépend pas de l'essence qu'on y regarde — « PY1 SDI1 » est le même BNC en
+# vidéo comme en ANC — donc les niveaux d'une même direction portent des libellés identiques.
+# La direction, elle, change tout : en entrée une destination est une VOIE, en sortie c'est un
+# CONNECTEUR, et les deux revendiquent le numéro 101. Sans niveau pour les séparer, l'un
+# écrase l'autre.
+#
+# ⚠ Cela suppose que le contrôleur redemande les DESTINATIONS pour chaque niveau. Les sources
+# portent un niveau sans ambiguïté ; pour les destinations, le champ existe en mode standard
+# (4 bits) mais le mode étendu n'en a pas, et certaines implémentations l'ignorent. Si VSM ne
+# demande les destinations qu'une fois, les niveaux de sortie rendront les mêmes que l'entrée
+# et les connecteurs de sortie resteront anonymes — ce qui se verra dans le journal, où le
+# niveau de chaque requête est tracé.
+LEVEL_PLAN = (
+    (1, "in", "video"), (2, "out", "video"),
+    (3, "in", "audio1"), (4, "out", "audio1"),
+    (5, "in", "audio2"), (6, "out", "audio2"),
+    (7, "in", "anc"), (8, "out", "anc"),
+    (9, "assign", None),
+)
+
+# ⚠ CONSTATÉ SUR LE PUPITRE RÉEL (2026-07-30) : ce que VSM appelle un « layer » est la
+# MATRICE de SW-P-08, pas le niveau. Configurer le layer 9 nous a fait recevoir l'octet 0x80 —
+# quartet haut à 8, donc matrice 9 en base 1 — le quartet de niveau restant à zéro. La
+# répartition ci-dessus s'indexe donc sur la MATRICE, et le plan tient dans les 16 valeurs du
+# quartet, ce qui recoupe le « jusqu'à 16 layers par connexion » de leur documentation.
+# Le niveau reste disponible pour un usage ultérieur ; aujourd'hui il ne porte rien.
+ESSENCE_LABELS = {"video": "vidéo", "audio1": "audio 1", "audio2": "audio 2",
+                  "anc": "ANC", None: "—"}
+STAGE_LABELS = {"in": "entrées", "out": "sorties", "assign": "affectation",
+                "test": "banc d'essai"}
+
+# niveau AFFICHÉ (base 1) → étage
+_STAGE_OF_LEVEL = {lvl: stage for lvl, stage, _ in LEVEL_PLAN}
+DEFAULT_STAGE = "in"        # un niveau hors plan retombe sur l'étage d'entrée
+
+_lock = threading.Lock()
+_sock = None
+_thread = None
+_stop = threading.Event()
+_clients = {}
+_status = {"running": False, "port": 0, "clients": 0, "last_error": None,
+           "requests": 0, "labels_sent": 0, "started_at": None}
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Réglages
+# ═════════════════════════════════════════════════════════════════════
+
+def _int_setting(key, default, lo, hi):
+    try:
+        v = int(settings.get(key) or default)
+    except (TypeError, ValueError):
+        v = default
+    return max(lo, min(hi, v))
+
+
+def port():
+    """Port d'écoute, ou 0 s'il n'est pas configuré. AUCUN défaut : la spec dit que le port se
+    configure par installation, il n'y a pas de valeur universelle à présumer."""
+    return _int_setting("swp08_port", 0, 0, 65535)
+
+
+def label_chars():
+    """4, 8 ou 12. Toute autre valeur est ramenée à la plus proche admise — le protocole n'en
+    connaît que trois, et une quatrième ne se négocie pas."""
+    want = _int_setting("swp08_label_chars", 12, 1, 64)
+    return min(proto.CHAR_LENGTHS, key=lambda c: (abs(c - want), -c))
+
+
+def sdi_per_slot():
+    """Connecteurs SDI ÉMIS par slot dans les grilles. Borne d'ÉMISSION, pas du plan : le plan
+    en réserve 50 (§12.2), mais les émettre tous pour seize slots ferait 800 libellés par
+    grille alors que la plus grosse machine du parc en porte 40. L'agrandir est sûr (on ajoute
+    en fin) ; le réduire fait disparaître des libellés déjà câblés au pupitre."""
+    return _int_setting("swp08_sdi_per_slot", 40, 1, 50)
+
+
+def ip_per_slot():
+    """Idem pour les Rx/Tx IP (le plan en réserve 49)."""
+    return _int_setting("swp08_ip_per_slot", 32, 1, 49)
+
+
+def matrices():
+    """{« étage »: numéro de matrice AFFICHÉ (base 1)}."""
+    return {"in": _int_setting("swp08_matrix_in", 1, 1, 256),
+            "out": _int_setting("swp08_matrix_out", 2, 1, 256)}
+
+
+def extended():
+    """Jeu de commandes étendu : 65 535 signaux et 256 niveaux, contre 1 024 et 16 en
+    standard. Notre plan monte à 1699 pour 16 slots, donc l'étendu n'est pas un confort.
+
+    `settings.get` ne prend PAS de défaut en argument : il le tire du manifeste du service
+    (`_service_defaults`), où `swp08_extended` vaut true."""
+    return bool(settings.get("swp08_extended"))
+
+
+def _fmt(key, default):
+    v = settings.get(key)
+    return str(v) if isinstance(v, str) and v.strip() else default
+
+
+def _short_names():
+    raw = settings.get("swp08_short_names")
+    return raw if isinstance(raw, dict) else {}
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Le parc, vu de la couche IPG
+# ═════════════════════════════════════════════════════════════════════
+
+def _ipg():
+    """(module ipg_io, erreur). Dépendance à sens unique et assumée, comme pour le TSL : ce
+    service NOMME ce que la couche IPG expose, et les numéros viennent d'elle seule — les
+    recalculer ici serait la garantie d'une divergence silencieuse."""
+    try:
+        from services.emberplus import ipg_io
+    except Exception as e:
+        return None, "services.emberplus.ipg_io illisible : %s" % e
+    return ipg_io, None
+
+
+def _auto_short(label):
+    """Nom court de repli quand aucun n'est saisi : initiales des mots + chiffres terminaux.
+    « Pélicase YB #1 » → « PYB1 ». Approximatif par nature — c'est un pis-aller lisible en
+    attendant que l'exploitant saisisse le sien, pas une politique de nommage."""
+    txt = str(label or "").strip()
+    if not txt:
+        return "?"
+    mots = [m for m in txt.replace("#", " ").split() if m]
+    ini = "".join(m[0] for m in mots if m[0].isalpha()).upper()
+    chiffres = "".join(c for c in txt if c.isdigit())
+    return ((ini or txt[:3].upper()) + chiffres)[:8] or "?"
+
+
+def _short(key, label, declare=None):
+    """Nom court d'un matériel, par ordre d'autorité : celui que déclare la COUCHE IPG (saisi
+    par l'exploitant dans l'outil), puis une surcharge propre à ce service, puis le repli
+    automatique. La couche IPG prime parce que le nom appartient au matériel, pas au
+    protocole — le TSL doit pouvoir lire le même."""
+    if isinstance(declare, str) and declare.strip():
+        return declare.strip()
+    val = _short_names().get(key)
+    return str(val).strip() if isinstance(val, str) and str(val).strip() else _auto_short(label)
+
+
+def _format(tmpl, **kw):
+    try:
+        return tmpl.format(**kw)
+    except (KeyError, IndexError, ValueError):
+        return kw.get("short", "")
+
+
+MODEL_TTL_S = 20
+_model_lock = threading.Lock()
+_model = {"tables": None, "error": None, "ts": 0.0}
+_contributor = None          # type d'outil portant la couche IPG (déduit, jamais codé en dur)
+
+# ── Matrice de TEST ──────────────────────────────────────────────────────────────────────
+# Un banc d'essai minuscule dont on connaît chaque octet : 8 sources, 8 destinations,
+# numérotées 1 à 8, des libellés évidents, et des croisements qui TIENNENT en mémoire.
+#
+# Sa raison d'être : séparer « le protocole est-il juste ? » de « notre modèle est-il juste ? ».
+# Le parc réel numérote ses signaux à partir de 101 (§12.2) et en compte 80 par étage ; si le
+# pupitre n'affiche rien, on ne sait pas si c'est le format des trames ou une plage hors de ce
+# qu'il attend. Ici il n'y a plus qu'une variable.
+TEST_SIZE = 8
+_test_tally = {n: n for n in range(1, TEST_SIZE + 1)}   # au départ, chaque dest sur sa source
+
+
+def test_matrix():
+    """Numéro de matrice servant le banc d'essai, ou 0 si le mode test est éteint."""
+    if not bool(settings.get("swp08_test")):
+        return 0
+    return _int_setting("swp08_test_matrix", 1, 1, 16)
+
+
+def model(force=False):
+    """Modèle en CACHE. Sa construction interroge tout le parc — mesuré à 7 s sur cette
+    installation, le SNP répondant en 4 à 9 s — ce qui est inacceptable dans la boucle de
+    réponse : le pupitre acquitte en une seconde et retransmet cinq fois. Un premier essai a
+    d'ailleurs fini en « broken pipe », le client ayant raccroché avant la réponse.
+
+    Deux règles qui en découlent :
+      • une reconstruction en cours ne bloque personne — on sert la copie PÉRIMÉE plutôt que
+        de faire attendre, un nom d'il y a vingt secondes valant mieux qu'un silence ;
+      • le cache est préchauffé au démarrage, pour que le premier client n'essuie pas les
+        plâtres."""
+    with _model_lock:
+        frais = (_model["tables"] is not None
+                 and (time.monotonic() - _model["ts"]) < MODEL_TTL_S)
+        if frais and not force:
+            return _model["tables"], _model["error"]
+        occupe = _model.get("building")
+        if occupe and _model["tables"] is not None:
+            return _model["tables"], _model["error"]     # périmé mais servable
+        _model["building"] = True
+    try:
+        tables, err = _build_model()
+    except Exception as e:                               # jamais lever dans une boucle réseau
+        tables, err = None, "construction du modèle échouée : %s" % e
+    with _model_lock:
+        _model["building"] = False
+        if tables is not None:
+            _model.update(tables=tables, error=err, ts=time.monotonic())
+        else:
+            _model["error"] = err
+            if _model["tables"] is not None:
+                # On sert le dernier bon modèle plutôt que rien — mais on REND l'erreur, et on
+                # la journalise. La masquer laissait croire à un modèle frais alors qu'il datait
+                # d'avant l'échec : c'est comme ça qu'un parc vidé a semblé encore peuplé, et
+                # le diagnostic est parti dans le décor pendant un moment.
+                log.warning("swp08: modèle périmé servi — %s", err)
+                return _model["tables"], err
+        return _model["tables"] or {}, _model["error"]
+
+
+def _build_model():
+    """Le parc traduit en termes SW-P-08, prêt à répondre :
+
+        {(étage, "source"|"dest"): {numéro affiché: libellé}}
+
+    Les numéros sont ceux du plan Ember+ (§12.2), repris tels quels de `ipg_io` — c'est la
+    propriété qu'on cherchait depuis le début : un même signal porte le même nombre dans les
+    deux protocoles. Les niveaux ne changent PAS les numéros (une essence n'est pas un autre
+    signal, c'est une couche du même), donc un seul jeu de libellés sert tous les niveaux.
+    """
+    global _contributor
+    ipg_io, err = _ipg()
+    if err:
+        return {}, err
+    try:
+        state = ipg_io.collect()
+        # Type d'outil qui porte la couche IPG, retenu pour lui renvoyer les affectations.
+        # On ne le code pas en dur : ce service n'a pas à connaître le nom de l'outil qui
+        # l'alimente, juste à savoir à qui réexpédier une écriture.
+        # ⚠ NE PAS le déduire des matériels affectés : l'agrégateur ne publie que ce qui est
+        # posé sur un slot, donc vider tous les slots effacerait la dernière trace de son
+        # existence et plus rien ne pourrait être réaffecté — un aller sans retour, constaté
+        # au banc le 2026-07-30. On lit le REGISTRE DES OUTILS, qui ne dépend d'aucun état.
+        _contributor = next(iter(ipg_io.io_types()), None) or next(
+            (d.get("type") for d in (state.get("devices") or {}).values() if d.get("type")),
+            None)
+    except Exception as e:
+        return {}, "collecte du parc échouée : %s" % e
+
+    sig_fmt = _fmt("swp08_signal_format", "{short} {kind}{n}")
+    lane_fmt = _fmt("swp08_lane_format", "{short} V{lane}")
+    slot_fmt = _fmt("swp08_slot_format", "IPG{slot} - {n}")
+    vide = _fmt("swp08_unused_label", ".")
+    nsdi, nip = sdi_per_slot(), ip_per_slot()
+    nslots, nlanes = ipg_io.num_slots(), ipg_io.lanes_per_slot()
+    out = {("in", "source"): {}, ("in", "dest"): {},
+           ("out", "source"): {}, ("out", "dest"): {},
+           ("assign", "source"): {}, ("assign", "dest"): {}}
+    numbers = state.get("numbers") or {}
+
+    # ── Grilles de signaux : PLEINES, comme celles d'Ember+ (§12.7) ───────────────────────
+    # Toutes les positions de tous les slots portent un libellé, qu'un matériel soit posé ou
+    # non. Trois cas, dans cet ordre :
+    #   • position servie par un matériel affecté  → son vrai nom  (« SNP1 SDI5 »)
+    #   • slot occupé, mais ce matériel n'a pas cette position → « . » (elle n'existe pas)
+    #   • slot vide → nom POSITIONNEL (« IPG3 - 5 »), pour que le pupitre se câble d'avance
+    # Sans ça, une position qui disparaît garde son ancien nom au pupitre, et une grille
+    # à moitié nommée se lit comme une panne.
+    for slot in range(1, nslots + 1):
+        occupe = bool((state.get("by_slot") or {}).get(slot))
+
+        def defaut(num, _slot=slot, _occupe=occupe):
+            # Le « y » du gabarit est le numéro LOCAL du plan (§12.2) : 1..50 pour les SDI,
+            # 51..99 pour les Rx/Tx IP. Reprendre l'index de la famille ferait porter le même
+            # libellé au SDI 1 et au Rx IP 1 — ils sont pourtant deux signaux distincts.
+            if _occupe:
+                return vide
+            local = num - ipg_io.SLOT_BLOCK * _slot
+            return _format(slot_fmt, slot=_slot, n=local, short="", kind="",
+                           lane=local, index=num, label="")
+
+        for kind, count in (("sdi", nsdi), ("ip", nip)):
+            for i in range(1, count + 1):
+                num = ipg_io.phys_signal(slot, kind, i)
+                out[("in", "source")][num] = defaut(num)
+                out[("out", "dest")][num] = defaut(num)
+        for lane in range(1, nlanes + 1):
+            num = ipg_io.lane_signal(slot, lane)
+            out[("in", "dest")][num] = defaut(num)
+            out[("out", "source")][num] = defaut(num)
+    for slot, key in sorted((state.get("by_slot") or {}).items()):
+        dev = (state.get("devices") or {}).get(key) or {}
+        court = _short(key, dev.get("label"), dev.get("short"))
+        n = numbers.get(key)
+        if n:
+            # Le tally de l'affectation : le slot EST la destination, le matériel qui l'occupe
+            # EST la source. Sans lui, un dump sur ce layer rend zéro croisement alors que
+            # l'information est la plus simple du service — c'est ce qui manquait au premier
+            # essai réel du 2026-07-30.
+            out.setdefault(("assign", "tally"), {})[slot] = ipg_io.DEV_SRC_OFFSET + n
+        # Connecteurs : sources de l'étage d'entrée, destinations de l'étage de sortie.
+        for sens, etage, role in (("inputs", "in", "source"), ("outputs", "out", "dest")):
+            for s in dev.get(sens) or []:
+                num = ipg_io.phys_signal(slot, s["kind"], s["index"])
+                out[(etage, role)][num] = _format(
+                    sig_fmt, short=court, slot=slot, kind=s["kind"].upper(),
+                    n=s["index"], index=num, label=s.get("label") or "", lane=0)
+        # Voies : destinations de l'étage d'entrée, sources de l'étage de sortie.
+        for lane in sorted(dev.get("lanes") or {}):
+            num = ipg_io.lane_signal(slot, lane)
+            lbl = _format(lane_fmt, short=court, slot=slot, lane=lane,
+                          index=num, kind="V", n=lane, label="")
+            out[("in", "dest")][num] = lbl
+            out[("out", "source")][num] = lbl
+            # ── Tally : QUI alimente cette voie ────────────────────────────────
+            # L'état vient du matériel via `ember/io` — on ne l'invente pas. Une voie sans
+            # source (« Désactivé ») reste absente du tally plutôt que d'être routée sur un
+            # signal 0 qui existerait : le pupitre doit voir un point de croisement vide,
+            # pas un faux.
+            blk = ((dev["lanes"][lane].get("in") or {}).get(ipg_io.ESSENCE_VIDEO) or {})
+            src = blk.get("src")
+            if isinstance(src, dict) and src.get("kind") in ("sdi", "ip"):
+                try:
+                    out.setdefault(("in", "tally"), {})[num] = ipg_io.phys_signal(
+                        slot, src["kind"], int(src["index"]))
+                except (TypeError, ValueError):
+                    pass
+            # ── Étage de SORTIE : quelle voie alimente quel connecteur ──────────────────
+            # Le sens s'inverse : ici la voie est la SOURCE et le connecteur la destination.
+            # Sur la plupart des familles ces points sont épinglés (le programme d'un SNP
+            # alimente en permanence son BNC et son Tx), mais épinglé ne veut pas dire absent :
+            # sans ce tally, les quatre layers de sortie restaient vides au pupitre.
+            oblk = ((dev["lanes"][lane].get("out") or {}).get(ipg_io.ESSENCE_VIDEO) or {})
+            for dst in (oblk.get("dst") or []):
+                if not isinstance(dst, dict) or dst.get("kind") not in ("sdi", "ip"):
+                    continue
+                try:
+                    out.setdefault(("out", "tally"), {})[
+                        ipg_io.phys_signal(slot, dst["kind"], int(dst["index"]))] = num
+                except (TypeError, ValueError):
+                    pass
+    # ── Grille d'affectation : PLEINE, comme celle d'Ember+ (§12.7) ───────────────────────
+    # Tous les slots émis figurent en destinations, occupés ou non, et TOUS les matériels
+    # connus en sources, posés ou non. N'y mettre que l'affecté avait deux conséquences que le
+    # banc a révélées : un slot vidé perdait son libellé, et le matériel qu'on venait d'en
+    # retirer disparaissait des sources — donc impossible de le reposer. La grille pleine rend
+    # aussi le pupitre configurable avant que le parc existe.
+    for slot in range(1, ipg_io.num_slots() + 1):
+        occupant = (state.get("by_slot") or {}).get(slot)
+        court = None
+        if occupant:
+            dev = (state.get("devices") or {}).get(occupant) or {}
+            court = _short(occupant, dev.get("label"), dev.get("short"))
+        out[("assign", "dest")][slot] = ("Slot %d %s" % (slot, court)) if court \
+            else "Slot %d" % slot
+    for key, dev in sorted((state.get("devices") or {}).items()):
+        n = numbers.get(key)
+        if n:
+            out[("assign", "source")][ipg_io.DEV_SRC_OFFSET + n] = _short(
+                key, dev.get("label"), dev.get("short"))
+
+    # ── Pseudo-sources : le bas de la plage (1..99), sans slot ────────────────────────────
+    # Elles ne désignent aucun matériel mais elles sont COMMUTABLES, et c'est par elles qu'on
+    # déconnecte. Sans libellé, le pupitre affiche un numéro nu là où l'opérateur cherche
+    # « Disconnect » — et c'est justement la source qu'on lui envoie à chaque déconnexion.
+    # Mêmes numéros que la grille Ember+, pour que les deux protocoles se lisent pareil.
+    for etage in ("in", "out", "assign"):
+        out.setdefault((etage, "source"), {})[ipg_io.PSEUDO_NONE] = "Disconnect"
+    # La mire n'existe que sur l'étage d'entrée : c'est une source, jamais une sortie.
+    out[("in", "source")][ipg_io.PSEUDO_PATTERN] = "Mire"
+    out.setdefault(("in", "tally"), {})
+    out.setdefault(("assign", "tally"), {})
+    # Banc d'essai : indépendant du parc, donc toujours présent et toujours identique.
+    out[("test", "source")] = {n: "SRC %d" % n for n in range(1, TEST_SIZE + 1)}
+    out[("test", "dest")] = {n: "DST %d" % n for n in range(1, TEST_SIZE + 1)}
+    out[("test", "tally")] = dict(_test_tally)
+    return out, None
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Réponse à une demande de noms
+# ═════════════════════════════════════════════════════════════════════
+
+def _stage_of(matrix_displayed, level_displayed=1):
+    """Étage servi par une requête. C'est la MATRICE qui porte la répartition — le « layer »
+    de VSM, constaté sur le pupitre réel (cf. LEVEL_PLAN). Le niveau est accepté en second
+    recours pour un contrôleur qui, lui, ferait varier ce champ-là : ça ne coûte rien et ça
+    évite de retomber en panne devant une implémentation différente.
+
+    Une valeur hors plan retombe sur l'étage d'entrée plutôt que de ne rien rendre : un
+    contrôleur qui explore ne doit pas conclure au silence."""
+    tm = test_matrix()
+    if tm and matrix_displayed == tm:
+        return "test"          # le banc d'essai prime : c'est le but, isoler le protocole
+    st = _STAGE_OF_LEVEL.get(matrix_displayed)
+    if st is None and level_displayed != 1:
+        st = _STAGE_OF_LEVEL.get(level_displayed)
+    return st or DEFAULT_STAGE
+
+
+def responses_for(req, tables=None):
+    """Liste de trames prêtes à partir, répondant à une demande décodée par `proto`.
+
+    Une matrice inconnue rend une liste VIDE plutôt qu'une erreur : le pupitre interroge
+    souvent tout ce qu'il sait faire, et répondre « je ne connais pas cette matrice » par un
+    NAK ferait passer une exploration normale pour une panne."""
+    if tables is None:
+        tables, err = model()
+        if err:
+            return [], err
+    etage = _stage_of(req["matrix"] + 1, req["level"] + 1)   # le fil est en base 0 (§10.3)
+    role = "dest" if req["kind"] == "dest" else "source"
+    labels = tables.get((etage, role)) or {}
+    if not labels:
+        return [], None
+    data_list = proto.name_responses(
+        req["kind"], labels, matrix=req["matrix"], level=req["level"],
+        char_length=req["char_length"], extended=req["extended"], first=1)
+    return [proto.pack(d) for d in data_list], None
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Serveur TCP
+# ═════════════════════════════════════════════════════════════════════
+
+_received = {}          # (matrice, niveau, type) -> {numéro: libellé} poussés par le pupitre
+_received_lock = threading.Lock()
+
+
+def received_names():
+    """Ce que le CONTRÔLEUR nous a poussé comme libellés. Purement documentaire aujourd'hui :
+    on l'expose pour pouvoir comparer son plan de nommage au nôtre."""
+    with _received_lock:
+        return {"%d/%d/%s" % k: dict(v) for k, v in sorted(_received.items())}
+
+
+def _absorb_names(addr, payload):
+    """Absorbe une réponse de noms VENUE du contrôleur. Rend True si c'en était une.
+
+    On ne les avait pas prévues — le protocole veut que le routeur nomme et que le pupitre
+    lise. Celui-ci fait l'inverse : il a poussé 320 trames de libellés sans jamais rien
+    demander. Les jeter serait perdre la seule information qu'il consent à donner sur son
+    propre plan de nommage."""
+    r = proto.decode_name_response(payload)
+    if not r:
+        return False
+    cle = (r["matrix"] + 1, r["level"] + 1, r["kind"])
+    with _received_lock:
+        cur = _received.setdefault(cle, {})
+        neuf = {n: l for n, l in r["labels"].items() if l}
+        premier = not cur
+        cur.update(neuf)
+        total = len(cur)
+    if premier:
+        log.info("swp08: %s POUSSE ses libellés — matrice %d niveau %d, %s (%d à ce stade)",
+                 addr, cle[0], cle[1], r["kind"], total)
+    return True
+
+
+_published = {}         # (layer, type) -> numéros déjà annoncés, pour savoir quoi EFFACER
+
+
+def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
+    """Envoie NOS libellés au contrôleur SANS qu'il les ait demandés.
+
+    Le protocole prévoit que le routeur soit interrogé (`100`/`102`) et réponde (`106`/`107`).
+    Le pupitre visé ne demande jamais — mais il POUSSE les siens de la même façon, et sa table
+    déclare `106` et `107` en « inbound », donc il sait les recevoir. On fait donc comme lui :
+    on pousse. C'est le seul chemin qui garde le nommage du parc chez nous, et il ne coûte
+    qu'un envoi de plus à la connexion.
+
+    Renvoie le nombre de trames émises."""
+    if tables is None:
+        tables, err = model()
+        if err:
+            return 0
+    n = 0
+    for layer, _stage, _ess in LEVEL_PLAN:
+        if matrices_wanted and layer not in matrices_wanted:
+            continue
+        etage = _stage_of(layer)
+        for kind, role in (("source", "source"), ("dest", "dest")):
+            labels = dict(tables.get((etage, role)) or {})
+            cle = (layer, kind)
+            if clear_stale:
+                # Un matériel qui rétrécit ou s'en va laisse des numéros ORPHELINS : le SNP et
+                # ses 32 voies remplacé par un CDE et ses 4, ce sont les voies 5 à 32 qui
+                # n'existent plus. Ne rien envoyer pour elles laisse le pupitre afficher
+                # l'ancien nom indéfiniment — constaté au banc : « SNP1 V5 » restait sur le 305
+                # après le déménagement. On les efface donc explicitement, par un libellé vide.
+                for orphelin in (_published.get(cle, set()) - set(labels)):
+                    labels[orphelin] = ""
+            if not labels:
+                continue
+            for data in proto.name_responses(kind, labels, matrix=layer - 1, level=0,
+                                             char_length=label_chars(), extended=False,
+                                             first=1):
+                if not _send(conn, proto.pack(data)):
+                    return n
+                n += 1
+            _published[cle] = set(tables.get((etage, role)) or {})
+    return n
+
+
+def _dual_status_byte():
+    return _int_setting("swp08_dual_status", 0x02, 0, 255)
+
+
+def _handle_routing(conn, addr, payload):
+    """Sert les commandes d'ÉTAT du routeur. Rend True si la trame a été traitée.
+
+    Sans elles, rien d'autre ne démarre : le pupitre interroge l'état du contrôleur (08) toutes
+    les dix secondes et, faute de réponse, ne considère jamais le routeur comme vivant — donc
+    ne demande jamais les noms. C'est ce qu'a montré le premier essai réel.
+
+    On ne COMMUTE pas par ce canal : le routage vit sur Ember+, et deux protocoles autorisés à
+    écrire le même crosspoint donneraient deux vérités. Un `connect` reçu est donc refusé — mais
+    en RÉPONDANT l'état vrai, pour que le point de croisement optimiste du pupitre claque en
+    arrière au lieu de mentir (même règle qu'au §12.3 côté Ember+)."""
+    r = proto.decode_routing(payload)
+    if not r:
+        return False
+    if r["kind"] == "dual_status":
+        _send(conn, proto.pack(proto.dual_status(_dual_status_byte())))
+        return True
+    tables, err = model()
+    if err:
+        log.warning("swp08: %s — état indisponible : %s", addr, err)
+        return True
+    etage = _stage_of(r["matrix"] + 1, r["level"] + 1)
+    tal = tables.get((etage, "tally")) or {}
+    if r["kind"] == "interrogate":
+        src = tal.get(r["dest"] + 1)          # base 0 sur le fil
+        if src is None:
+            return True                        # destination sans source : pas de tally menteur
+        _send_tally(conn, r["matrix"], r["level"], r["dest"], src - 1)
+        return True
+    if r["kind"] == "connect":
+        if etage == "test":
+            # Le banc d'essai ACCEPTE tout et le retient : c'est ce qui prouve que la boucle
+            # complète fonctionne — connect reçu, état modifié, `04` renvoyé, tally cohérent
+            # au dump suivant. Purement en mémoire, aucun matériel n'est touché.
+            dest, src = r["dest"] + 1, (r["source"] or 0) + 1
+            if 1 <= dest <= TEST_SIZE and 1 <= src <= TEST_SIZE:
+                _test_tally[dest] = src
+                model(force=True)
+                log.info("swp08: %s — TEST dest %d ← src %d (accepté)", addr, dest, src)
+                _send_tally(conn, r["matrix"], r["level"], r["dest"],
+                                                   r["source"] or 0, connected=True)
+            else:
+                log.info("swp08: %s — TEST hors plage (dest %d, src %d, max %d)",
+                         addr, dest, src, TEST_SIZE)
+        elif etage == "assign":
+            _apply_assign(conn, addr, r, tal)
+        else:
+            # Les SIGNAUX ne se routent pas par ce canal : Ember+ le fait déjà, et deux
+            # protocoles autorisés à écrire le même crosspoint donneraient deux vérités. On
+            # répond quand même l'état réel — un `04` — pour que le point de croisement
+            # optimiste du pupitre claque en arrière au lieu de mentir (§12.3).
+            vrai = tal.get(r["dest"] + 1)
+            log.info("swp08: %s — connect REFUSÉ (dest %d ← src %d) : le routage des signaux "
+                     "passe par Ember+", addr, r["dest"] + 1, (r["source"] or 0) + 1)
+            if vrai is not None:
+                _send_tally(conn, r["matrix"], r["level"], r["dest"],
+                                                   vrai - 1, connected=True)
+        return True
+    if r["kind"] == "tally_dump":
+        # Découpé en tranches CONTIGUËS de 64 : le format n'annonce qu'une destination de
+        # départ suivie de N sources consécutives, donc un trou impose un nouveau message.
+        envoyes = 0
+        for run in _runs(sorted(tal)):
+            for i in range(0, len(run), proto.TALLY_DUMP_MAX):
+                bout = run[i:i + proto.TALLY_DUMP_MAX]
+                data = proto.tally_dump_word(r["matrix"], r["level"], bout[0] - 1,
+                                             [tal[d] - 1 for d in bout])
+                _send(conn, proto.pack(data))
+                envoyes += 1
+        log.info("swp08: %s — dump matrice %d niveau %d (%s) → %d message(s), %d tally",
+                 addr, r["matrix"] + 1, r["level"] + 1,
+                 STAGE_LABELS.get(etage, "?"), envoyes, len(tal))
+        return True
+    return False
+
+
+def _apply_assign(conn, addr, r, tal):
+    """Pose un matériel sur un slot depuis le pupitre (layer « affectation »).
+
+    Contrairement au routage des signaux, l'affectation n'a QU'UN propriétaire — la couche IPG
+    — et le service Ember+ y renvoie déjà les écritures de sa grille 1010. Le layer 9 emprunte
+    le même chemin : deux portes, une seule serrure, donc pas de seconde vérité.
+
+    ⚠ Un déplacement RENUMÉROTE tout le matériel concerné (`100×slot + n` sur ses voies comme
+    sur ses connecteurs, et son sous-arbre Ember+ change de chemin). Le §12.8 décrit ça comme
+    un déménagement hors service, pas un geste de production. C'est un pouvoir réel qu'on donne
+    au pupitre, d'où le réglage `swp08_allow_assign` pour le retirer en exploitation."""
+    slot = r["dest"] + 1
+    ancien = tal.get(slot)
+    if not bool(settings.get("swp08_allow_assign")):
+        log.info("swp08: %s — affectation refusée (slot %d) : `swp08_allow_assign` est faux",
+                 addr, slot)
+        if ancien is not None:
+            _send_tally(conn, r["matrix"], r["level"], r["dest"],
+                                               ancien - 1, connected=True)
+        return
+    ipg_io, err = _ipg()
+    if err or not _contributor:
+        log.warning("swp08: %s — affectation impossible : %s", addr, err or "couche IPG absente")
+        return
+    src = (r["source"] or 0) + 1
+    # Source 1 = « Disconnect » (PSEUDO_NONE) : c'est le geste qui VIDE le slot. Les matériels
+    # commencent à 11 (DEV_SRC_OFFSET + 1), donc tout ce qui est en dessous vide.
+    numero = src - ipg_io.DEV_SRC_OFFSET
+    libere = numero <= 0
+    payload = {"slot": slot, "number": None if libere else numero}
+    try:
+        status, data = tools.call(_contributor, "ipg/assign", "POST", payload,
+                                  actor=SWP08_ACTOR, timeout=15)
+    except Exception as e:
+        log.warning("swp08: %s — renvoi de l'affectation a levé : %s", addr, e)
+        return
+    ok = status == 200 and isinstance(data, dict) and not data.get("error")
+    if not ok:
+        log.info("swp08: %s — affectation refusée par la couche IPG → %s %s", addr, status, data)
+    else:
+        quoi = "libéré" if libere else "← matériel n° %d (source %d)" % (numero, src)
+        log.info("swp08: %s — slot %d %s", addr, slot, quoi)
+        audit_log("swp08", "assign", "slot %d %s" % (slot, quoi),
+                  user_id=None, username=SWP08_ACTOR)
+    # L'état a bougé : le modèle en cache est périmé, on le reconstruit AVANT de répondre pour
+    # que le tally renvoyé soit le vrai — un pupitre qui reçoit l'ancien état croit à un échec.
+    tables, _ = model(force=True)
+    apres = tables.get(("assign", "tally")) or {}
+    # ── Un déplacement change DEUX croisements ────────────────────────────────────────
+    # L'affectation est du 1 pour 1 : poser un matériel déjà placé ailleurs le DÉPLACE, donc
+    # son ancien slot se vide. Ne confirmer que la destination demandée laisserait le pupitre
+    # afficher le matériel à deux endroits — ce qui est justement l'état que le modèle interdit.
+    # On renvoie donc un `04` pour CHAQUE slot dont l'occupant a changé.
+    for s in sorted(set(tal) | set(apres)):
+        avant, maintenant = tal.get(s), apres.get(s)
+        if avant == maintenant:
+            continue
+        # Slot vidé : on l'annonce sur le pseudo-signal « Aucun », le même que la grille 1010.
+        src_num = maintenant if maintenant is not None else ipg_io.PSEUDO_NONE
+        _send_tally(conn, r["matrix"], r["level"], s - 1,
+                                           src_num - 1, connected=True)
+        log.info("swp08: slot %d → %s", s,
+                 "matériel %d" % maintenant if maintenant else "vide")
+    # Les AUTRES clients, et surtout les libellés : un déplacement renumérote tout le matériel
+    # concerné, donc ses noms changent aussi. En fond pour ne pas retarder la réponse.
+    threading.Thread(target=notify_change, daemon=True).start()
+
+
+def _runs(nums):
+    """Découpe une suite triée en tranches d'entiers consécutifs."""
+    out, cur = [], []
+    for n in nums:
+        if cur and n != cur[-1] + 1:
+            out.append(cur)
+            cur = []
+        cur.append(n)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _serve_client(conn, addr):
+    """Un client. Le protocole exige un ACK par message reçu, y compris sur IP (Appendix 2) —
+    c'est la première chose qu'on renvoie, avant même de préparer la réponse : le pupitre
+    retransmet cinq fois en l'absence d'acquittement, et une réponse lente ne doit pas être
+    prise pour une réponse perdue."""
+    buf = b""
+    conn.settimeout(CLIENT_IDLE_S)
+    try:
+        while not _stop.is_set():
+            try:
+                chunk = conn.recv(4096)
+            except socket.timeout:
+                break
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            events, buf = proto.unpack(buf)
+            for kind, payload in events:
+                if kind == "erreur":
+                    log.info("swp08: %s — trame rejetée : %s", addr, payload)
+                    _send(conn, proto.FRAME_NAK)
+                    continue
+                if kind in ("ack", "nak"):
+                    continue            # acquittements du client : rien à faire de plus
+                _send(conn, proto.FRAME_ACK)
+                if _absorb_names(addr, payload):
+                    continue
+                if _handle_routing(conn, addr, payload):
+                    continue
+                req = proto.decode_request(payload)
+                if not req:
+                    log.info("swp08: %s — commande %02X non gérée (ignorée)",
+                             addr, payload[0] if payload else 0)
+                    continue
+                with _lock:
+                    _status["requests"] += 1
+                frames, err = responses_for(req)
+                if err:
+                    log.warning("swp08: %s — réponse impossible : %s", addr, err)
+                    continue
+                for f in frames:
+                    _send(conn, f)
+                with _lock:
+                    _status["labels_sent"] += len(frames)
+                log.info("swp08: %s — %s matrice %d niveau %d (%s) → %d message(s)",
+                         addr, req["kind"], req["matrix"] + 1, req["level"] + 1,
+                         STAGE_LABELS.get(_stage_of(req["matrix"] + 1, req["level"] + 1), "?"), len(frames))
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+        with _lock:
+            _clients.pop(addr, None)
+            _status["clients"] = len(_clients)
+
+
+def _send(conn, data):
+    try:
+        conn.sendall(data)
+        return True
+    except OSError as e:
+        log.info("swp08: émission échouée : %s", e)
+        return False
+
+
+_hors_portee = set()        # numéros déjà signalés, pour ne pas noyer le journal
+
+
+def _send_tally(conn, matrix, level, dest, source, *, connected=False):
+    """Émet un tally/connected, ou RENONCE si les numéros dépassent ce que les commandes
+    standard savent adresser (1023, cf. `proto.tally`). Renoncer bruyamment vaut mieux que
+    replier en silence : au-delà du slot 10, le pupitre afficherait des croisements sur les
+    mauvaises destinations sans que rien ne le signale."""
+    try:
+        return _send(conn, proto.pack(proto.tally(matrix, level, dest, source,
+                                                  connected=connected)))
+    except ValueError as e:
+        cle = (dest, source)
+        if cle not in _hors_portee:
+            _hors_portee.add(cle)
+            log.warning("swp08: croisement non annonçable — %s. Les commandes étendues "
+                        "(129-132) restent à implémenter ; en attendant, réduire "
+                        "`emberplus_slots_count` à 10 garde tout le parc adressable.", e)
+        return False
+
+
+_last_assign = {}       # {layer: {dest: source}} déjà diffusé — sert à n'annoncer que les écarts
+                        # ET à repérer les destinations DISPARUES, qu'il faut déconnecter.
+
+
+_notify_lock = threading.Lock()
+_notify_pending = threading.Event()
+
+
+def notify_change():
+    """Diffusion COALESCÉE : une seule à la fois, et une demande reçue pendant qu'elle tourne
+    en déclenche exactement une de plus, pas une par appel.
+
+    Sans ça, la course est garantie : une diffusion reconstruit le modèle, ce qui réinterroge
+    tout le parc et prend plusieurs secondes. Libérer trois slots en vingt secondes lançait
+    donc trois diffusions concurrentes, qui comparaient chacune l'état frais au MÊME repère
+    global — et la plus lente annonçait au pupitre une transition déjà périmée. Constaté le
+    2026-07-30 : un slot vidé se rallumait tout seul une seconde plus tard, non pas parce que
+    la libération avait échoué, mais parce qu'on la démentait nous-mêmes."""
+    _notify_pending.set()
+    if not _notify_lock.acquire(blocking=False):
+        return 0                      # une diffusion tourne déjà : elle repassera pour nous
+    total = 0
+    try:
+        while _notify_pending.is_set():
+            _notify_pending.clear()
+            total += _notify_once()
+    finally:
+        _notify_lock.release()
+    return total
+
+
+def _notify_once():
+    """Un tour de diffusion. À n'appeler QUE depuis `notify_change`, qui en sérialise l'accès.
+
+    Il ne redemande jamais les noms (`NamesUpdated` n'est pas implémenté chez lui) et ne
+    refait un dump qu'à sa guise. Une affectation changée depuis notre écran resterait donc
+    invisible — c'est ce qui a été constaté en déplaçant un SNP sans que rien ne bouge.
+
+    On diffuse donc, comme la spec l'autorise pour le `04` (« *issued spontaneously by the
+    controller on all ports, effectively broadcast* ») : les croisements d'affectation qui ont
+    changé, puis TOUS les libellés. Les libellés parce qu'un déplacement de slot renumérote le
+    matériel entier — ses voies comme ses connecteurs — donc ce ne sont pas trois lignes qui
+    changent, c'est tout son nommage."""
+    global _last_assign
+    tables, err = model(force=True)
+    if err:
+        log.info("swp08: parc indisponible, diffusion annulée : %s", err)
+        return 0
+    with _lock:
+        conns = list(_clients.values())
+    if not conns:
+        _last_assign = dict(tables.get(("assign", "tally")) or {})
+        return 0
+    ipg_io, _ = _ipg()
+    vide = getattr(ipg_io, "PSEUDO_NONE", 1) if ipg_io else 1
+    # Diff des croisements sur TOUS les layers, pas seulement l'affectation : quand un matériel
+    # déménage, les destinations de son ancien slot cessent d'exister et le pupitre continuerait
+    # de les afficher commutées. Une destination disparue est annoncée « déconnectée ».
+    nouveau = {}
+    envoyes = 0
+    for layer, stage, _ess in LEVEL_PLAN:
+        etage = _stage_of(layer)
+        apres = tables.get((etage, "tally")) or {}
+        nouveau[layer] = dict(apres)
+        avant = _last_assign.get(layer) or {}
+        for dest in sorted(set(avant) | set(apres)):
+            a, b = avant.get(dest), apres.get(dest)
+            if a == b:
+                continue
+            src = b if b is not None else vide
+            for conn in conns:
+                if _send_tally(conn, layer - 1, 0, dest - 1, src - 1, connected=True):
+                    envoyes += 1
+    for conn in conns:
+        envoyes += push_names(conn, tables, clear_stale=True)
+    _last_assign = nouveau
+    if envoyes:
+        log.info("swp08: parc modifié — %d trame(s) diffusée(s) à %d client(s)",
+                 envoyes, len(conns))
+    return envoyes
+
+
+def _push_on_connect(conn, addr):
+    """Petite temporisation avant de pousser : laisser le pupitre finir sa propre séquence
+    d'ouverture (état du contrôleur, dumps) évite d'entrelacer nos trames avec les siennes
+    pendant qu'il s'installe."""
+    time.sleep(2.0)
+    try:
+        n = push_names(conn)
+    except Exception as e:
+        log.warning("swp08: %s — poussée des libellés échouée : %s", addr, e)
+        return
+    if n:
+        log.info("swp08: %s — %d trame(s) de libellés poussée(s) spontanément", addr, n)
+
+
+def _server_loop(p):
+    global _sock
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", p))
+        srv.listen(MAX_CLIENTS)
+        srv.settimeout(ACCEPT_TIMEOUT_S)
+    except OSError as e:
+        with _lock:
+            _status["last_error"] = "écoute sur :%d impossible — %s" % (p, e)
+            _status["running"] = False
+        log.error("swp08: %s", _status["last_error"])
+        return
+    _sock = srv
+    with _lock:
+        _status.update(running=True, port=p, last_error=None, started_at=time.time())
+    log.info("swp08: écoute sur :%d", p)
+    while not _stop.is_set():
+        try:
+            conn, addr = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        with _lock:
+            trop = len(_clients) >= MAX_CLIENTS
+        if trop:
+            # Plafond de la spec. On ferme franchement plutôt que d'accepter et de se taire :
+            # un client silencieux est bien plus difficile à diagnostiquer qu'un refus net.
+            log.warning("swp08: %s refusé — %d clients déjà connectés", addr, MAX_CLIENTS)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
+        if bool(settings.get("swp08_push_names")):
+            # Poussée à la connexion, en fond : le pupitre ne demandera jamais nos noms, mais
+            # il accepte qu'on les lui envoie. En fond parce que la construction du modèle peut
+            # prendre quelques secondes à froid, et que l'accueil du client ne doit pas attendre.
+            threading.Thread(target=_push_on_connect, args=(conn, addr), daemon=True).start()
+        t = threading.Thread(target=_serve_client, args=(conn, addr), daemon=True)
+        with _lock:
+            _clients[addr] = conn        # la SOCKET, pas le fil : c'est elle qui sert à diffuser
+            _status["clients"] = len(_clients)
+        t.start()
+        log.info("swp08: client %s connecté", addr)
+    try:
+        srv.close()
+    except OSError:
+        pass
+    with _lock:
+        _status.update(running=False, clients=0)
+    log.info("swp08: arrêt de l'écoute")
+
+
+def start(p):
+    global _thread
+    stop()
+    if not (1 <= p <= 65535):
+        with _lock:
+            _status["last_error"] = "port non configuré"
+        return False
+    _stop.clear()
+    _thread = threading.Thread(target=_server_loop, args=(p,), daemon=True)
+    _thread.start()
+    return True
+
+
+def stop():
+    global _sock, _thread
+    _stop.set()
+    if _sock is not None:
+        try:
+            _sock.close()
+        except OSError:
+            pass
+        _sock = None
+    if _thread is not None and _thread.is_alive():
+        _thread.join(timeout=2.0)
+    _thread = None
+    with _lock:
+        _status.update(running=False, clients=0)
+
+
+def is_running():
+    with _lock:
+        return bool(_status["running"])
+
+
+def status_dict():
+    with _lock:
+        return dict(_status)
+
+
+def boot():
+    if bool(settings.get("swp08_enabled")):
+        p = port()
+        if p:
+            start(p)
+            # Préchauffage en fond : la première construction coûte plusieurs secondes, et
+            # elle ne doit pas tomber sur le premier client. Le démarrage, lui, n'attend pas.
+            threading.Thread(target=lambda: model(force=True), daemon=True).start()
+        else:
+            log.info("swp08: activé mais sans port — rien n'écoute")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Routes
+# ═════════════════════════════════════════════════════════════════════
+
+def register_routes(bp):
+    from flask import request, jsonify
+    from app.auth import require_login, require_perm
+
+    @bp.route("/api/swp08/status", methods=["GET"])
+    @require_login
+    def swp08_status():
+        out = status_dict()
+        # TOUS les réglages, pas seulement ceux du transport. Convention : `swp08_X` se lit en
+        # `X_setting` et s'écrit par le champ `X` d'`apply`. Les deux routes doivent rester
+        # SYMÉTRIQUES : un réglage écrivable mais non relu ferait qu'un simple « Enregistrer »
+        # écraserait la valeur en base par le défaut affiché à l'écran.
+        out.update(enabled_setting=bool(settings.get("swp08_enabled")),
+                   port_setting=port(), label_chars_setting=label_chars(),
+                   extended_setting=extended(), matrices_setting=matrices(),
+                   allow_assign_setting=bool(settings.get("swp08_allow_assign")),
+                   push_names_setting=bool(settings.get("swp08_push_names")),
+                   dual_status_setting=_dual_status_byte(),
+                   test_setting=bool(settings.get("swp08_test")),
+                   test_matrix_setting=_int_setting("swp08_test_matrix", 1, 1, 16),
+                   sdi_per_slot_setting=sdi_per_slot(),
+                   ip_per_slot_setting=ip_per_slot(),
+                   signal_format_setting=_fmt("swp08_signal_format", "{short} {kind}{n}"),
+                   lane_format_setting=_fmt("swp08_lane_format", "{short} V{lane}"),
+                   slot_format_setting=_fmt("swp08_slot_format", "IPG{slot} - {n}"),
+                   unused_label_setting=_fmt("swp08_unused_label", "."),
+                   levels=[{"level": lvl, "stage": st, "essence": es,
+                            "label": "%s %s" % (STAGE_LABELS[st], ESSENCE_LABELS[es])}
+                           for lvl, st, es in LEVEL_PLAN])
+        tables, err = model()
+        out["source_error"] = err
+        out["counts"] = {"%s/%s" % k: len(v) for k, v in sorted(tables.items())}
+        return jsonify(out)
+
+    @bp.route("/api/swp08/received", methods=["GET"])
+    @require_login
+    def swp08_received():
+        """Les libellés que le CONTRÔLEUR nous a poussés — clé « matrice/niveau/type ».
+        Purement documentaire : c'est ce qui permet de comparer son plan de nommage au nôtre."""
+        return jsonify(received_names())
+
+    @bp.route("/api/swp08/preview", methods=["GET"])
+    @require_login
+    def swp08_preview():
+        """Ce qui PARTIRAIT, sans qu'aucune socket ne s'ouvre — et en hexadécimal commenté.
+
+        C'est le seul moyen d'éprouver les commandes de noms tant qu'aucun pupitre n'est
+        branché, et elles en ont besoin : ce sont les seules parties du protocole qu'aucune
+        spec publique ne décrit."""
+        kind = request.args.get("kind") or "source"
+        try:
+            level = max(1, min(256, int(request.args.get("level") or 1)))
+        except (TypeError, ValueError):
+            level = 1
+        etage = _stage_of(level)
+        req = {"cmd": 0, "extended": extended(), "kind": kind,
+               "matrix": max(0, matrices()["in"] - 1), "level": level - 1,
+               "char_length": label_chars(), "char_index": 0}
+        tables, err = model()
+        if err:
+            return jsonify({"error": err}), 503
+        frames, _ = responses_for(req, tables)
+        labels = tables.get((etage, "dest" if kind == "dest" else "source")) or {}
+        return jsonify({
+            "stage": etage, "kind": kind, "level": level,
+            "matrix": matrices()["in"], "label_chars": label_chars(),
+            "extended": extended(), "labels": len(labels), "frames": len(frames),
+            "sample": {"hex": proto.hexstring(frames[0]),
+                       "annotated": proto.annotate(frames[0]),
+                       "size": len(frames[0])} if frames else None,
+            "preview": [{"number": n, "label": labels[n]} for n in sorted(labels)[:40]],
+        })
+
+    @bp.route("/api/swp08/apply", methods=["POST"])
+    @require_perm("settings.edit")
+    def swp08_apply():
+        d = request.json or {}
+        if "port" in d:
+            try:
+                p = int(d.get("port") or 0)
+            except (TypeError, ValueError):
+                return jsonify({"error": "port invalide"}), 400
+            if p and not (1 <= p <= 65535):
+                return jsonify({"error": "port hors bornes"}), 400
+            settings.set("swp08_port", p)
+        if "label_chars" in d:
+            try:
+                c = int(d.get("label_chars"))
+            except (TypeError, ValueError):
+                return jsonify({"error": "longueur de libellé invalide"}), 400
+            if c not in proto.CHAR_LENGTHS:
+                return jsonify({"error": "longueur de libellé : %s uniquement"
+                                         % ", ".join(map(str, proto.CHAR_LENGTHS))}), 400
+            settings.set("swp08_label_chars", c)
+        for key, field, lo, hi, lbl in (
+                ("swp08_matrix_in", "matrix_in", 1, 256, "matrice d'entrées"),
+                ("swp08_matrix_out", "matrix_out", 1, 256, "matrice de sorties"),
+                ("swp08_dual_status", "dual_status", 0, 255, "octet d'état du contrôleur"),
+                ("swp08_test_matrix", "test_matrix", 1, 16, "matrice du banc d'essai"),
+                ("swp08_sdi_per_slot", "sdi_per_slot", 1, 50, "connecteurs SDI par slot"),
+                ("swp08_ip_per_slot", "ip_per_slot", 1, 49, "Rx/Tx IP par slot")):
+            if field not in d:
+                continue
+            try:
+                v = int(d.get(field))
+            except (TypeError, ValueError):
+                return jsonify({"error": "%s invalide" % lbl}), 400
+            if not (lo <= v <= hi):
+                return jsonify({"error": "%s hors bornes (%d–%d)" % (lbl, lo, hi)}), 400
+            settings.set(key, v)
+        # Les deux matrices PEUVENT être identiques : depuis que la répartition s'indexe sur
+        # la MATRICE (le « layer » de VSM, cf. LEVEL_PLAN), ces deux réglages ne servent plus
+        # qu'à la route de prévisualisation. Ils ne séparent plus rien.
+        for key, field in (("swp08_extended", "extended"),
+                           ("swp08_allow_assign", "allow_assign"),
+                           ("swp08_push_names", "push_names"),
+                           ("swp08_test", "test")):
+            if field in d:
+                settings.set(key, bool(d.get(field)))
+        for key, field in (("swp08_signal_format", "signal_format"),
+                           ("swp08_lane_format", "lane_format"),
+                           ("swp08_slot_format", "slot_format"),
+                           ("swp08_unused_label", "unused_label")):
+            if field in d:
+                settings.set(key, str(d.get(field) or ""))
+        # La taille des grilles et les gabarits changent TOUS les libellés : le modèle en cache
+        # doit repartir, sinon le pupitre garderait l'ancien nommage jusqu'à sa péremption.
+        if any(f in d for f in ("sdi_per_slot", "ip_per_slot", "signal_format", "lane_format",
+                                "slot_format", "unused_label", "label_chars", "test",
+                                "test_matrix")):
+            threading.Thread(target=notify_change, daemon=True).start()
+        if isinstance(d.get("short_names"), dict):
+            settings.set("swp08_short_names",
+                         {str(k): str(v)[:12] for k, v in d["short_names"].items()})
+        enabled = bool(d.get("enabled", settings.get("swp08_enabled")))
+        settings.set("swp08_enabled", enabled)
+        if enabled and port():
+            start(port())
+        else:
+            stop()
+        audit_log("swp08", "apply", "enabled=%s port=%s chars=%d"
+                  % (enabled, port(), label_chars()), user_id=None, username=SWP08_ACTOR)
+        return jsonify(status_dict())
