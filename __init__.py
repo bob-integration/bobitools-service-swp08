@@ -564,6 +564,32 @@ def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
     return n
 
 
+def write_allow_list():
+    raw = settings.get("swp08_write_allow") or ""
+    return {p.strip() for p in str(raw).replace(";", ",").split(",") if p.strip()}
+
+
+def _write_allowed(addr):
+    """Vrai si cette adresse a le droit d'ÉCRIRE (affectation d'un slot).
+
+    Mêmes règles et mêmes semantiques que `emberplus._write_allowed` — une seule règle à
+    retenir pour les deux protocoles de pupitre. Le protocole ne prévoit aucune
+    authentification, donc on restreint par adresse : le pupitre déclaré écrit, tout le monde
+    peut lire, et un client de diagnostic ne casse rien.
+
+    Ce qui se joue ici est plus lourd que côté Ember+ : une écriture sur le layer d'affectation
+    DÉPLACE un matériel, donc renumérote tous ses signaux et toutes ses voies (§12.8). C'est un
+    déménagement de parc accessible en un crosspoint.
+
+    Liste VIDE = aucune restriction, pour ne rien casser sur une installation existante — mais
+    l'état est journalisé au démarrage, faute de quoi une protection jamais configurée serait
+    exactement le « livré mais pas en service » qui a déjà coûté cher à ce projet."""
+    allow = write_allow_list()
+    if not allow:
+        return True
+    return (addr[0] if isinstance(addr, (tuple, list)) else str(addr)) in allow
+
+
 def _dual_status_byte():
     return _int_setting("swp08_dual_status", 0x02, 0, 255)
 
@@ -657,6 +683,12 @@ def _apply_assign(conn, addr, r, tal):
     au pupitre, d'où le réglage `swp08_allow_assign` pour le retirer en exploitation."""
     slot = r["dest"] + 1
     ancien = tal.get(slot)
+    if not _write_allowed(addr):
+        log.warning("swp08: %s — affectation REFUSÉE : adresse hors de `swp08_write_allow`",
+                    addr)
+        if ancien is not None:
+            _send_tally(conn, r["matrix"], r["level"], r["dest"], ancien - 1, connected=True)
+        return
     if not bool(settings.get("swp08_allow_assign")):
         log.info("swp08: %s — affectation refusée (slot %d) : `swp08_allow_assign` est faux",
                  addr, slot)
@@ -801,16 +833,19 @@ def _send_tally(conn, matrix, level, dest, source, *, connected=False):
     standard savent adresser (1023, cf. `proto.tally`). Renoncer bruyamment vaut mieux que
     replier en silence : au-delà du slot 10, le pupitre afficherait des croisements sur les
     mauvaises destinations sans que rien ne le signale."""
+    # On n'emploie l'ÉTENDU que si le standard ne suffit pas. Le standard est éprouvé au banc
+    # sur ce pupitre ; l'étendu ne l'est pas — sa disposition vient du module Companion, comme
+    # les commandes de noms. Basculer tout le parc dessus risquerait de casser ce qui marche
+    # pour un gain nul en dessous de 1024.
+    ext = max(dest, source) > proto.STD_SIGNAL_MAX
     try:
         return _send(conn, proto.pack(proto.tally(matrix, level, dest, source,
-                                                  connected=connected)))
+                                                  connected=connected, extended=ext)))
     except ValueError as e:
         cle = (dest, source)
         if cle not in _hors_portee:
             _hors_portee.add(cle)
-            log.warning("swp08: croisement non annonçable — %s. Les commandes étendues "
-                        "(129-132) restent à implémenter ; en attendant, réduire "
-                        "`emberplus_slots_count` à 10 garde tout le parc adressable.", e)
+            log.warning("swp08: croisement non annonçable — %s", e)
         return False
 
 
@@ -927,7 +962,10 @@ def _server_loop(p):
     _sock = srv
     with _lock:
         _status.update(running=True, port=p, last_error=None, started_at=time.time())
-    log.info("swp08: écoute sur :%d", p)
+    allow = write_allow_list()
+    log.info("swp08: écoute sur :%d — écriture %s", p,
+             "restreinte à %s" % ", ".join(sorted(allow)) if allow
+             else "OUVERTE À TOUS (`swp08_write_allow` vide)")
     while not _stop.is_set():
         try:
             conn, addr = srv.accept()
@@ -1005,6 +1043,27 @@ def status_dict():
         return dict(_status)
 
 
+def _prime():
+    """Préchauffe le modèle ET AMORCE LE REPÈRE des croisements.
+
+    Sans cet amorçage, `_last_assign` reste vide jusqu'à la première diffusion : le premier
+    changement ne voit donc que des ARRIVÉES, jamais les disparitions, et les croisements de
+    l'ancien slot restent affichés au pupitre. Constaté au banc le 2026-07-30 en déplaçant un
+    SNP du slot 11 au 12 — les libellés se sont bien effacés (leur repère, lui, est renseigné
+    par chaque poussée, donc dès la connexion du client) mais pas les croisements.
+
+    C'est la même asymétrie qui rendait le défaut trompeur : deux mécanismes voisins, deux
+    états initiaux différents."""
+    global _last_assign
+    tables, err = model(force=True)
+    if err:
+        return
+    _last_assign = {layer: dict(tables.get((_stage_of(layer), "tally")) or {})
+                    for layer, _st, _e in LEVEL_PLAN}
+    log.info("swp08: modèle préchauffé, repère des croisements amorcé (%d layer(s))",
+             len(_last_assign))
+
+
 def boot():
     if bool(settings.get("swp08_enabled")):
         p = port()
@@ -1012,7 +1071,7 @@ def boot():
             start(p)
             # Préchauffage en fond : la première construction coûte plusieurs secondes, et
             # elle ne doit pas tomber sur le premier client. Le démarrage, lui, n'attend pas.
-            threading.Thread(target=lambda: model(force=True), daemon=True).start()
+            threading.Thread(target=_prime, daemon=True).start()
         else:
             log.info("swp08: activé mais sans port — rien n'écoute")
 

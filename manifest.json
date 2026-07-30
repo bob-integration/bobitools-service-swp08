@@ -76,6 +76,10 @@
     "swp08_unused_label": {
       "type": "text",
       "default": "."
+    },
+    "swp08_write_allow": {
+      "type": "text",
+      "default": ""
     }
   }
 }

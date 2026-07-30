@@ -364,6 +364,15 @@ def decode_routing(data):
         if cmd == CMD_TALLY_DUMP_REQ:
             return {"cmd": cmd, "kind": "tally_dump",
                     "matrix": (data[1] & 0xF0) >> 4, "level": data[1] & 0x0F}
+        if cmd in (CMD_EXT_INTERROGATE, CMD_EXT_CONNECT):
+            dest = (data[3] << 8) | data[4]
+            src = ((data[5] << 8) | data[6]) if cmd == CMD_EXT_CONNECT else None
+            return {"cmd": cmd, "extended": True,
+                    "kind": "connect" if cmd == CMD_EXT_CONNECT else "interrogate",
+                    "matrix": data[1], "level": data[2], "dest": dest, "source": src}
+        if cmd == CMD_EXT_TALLY_DUMP_REQ:
+            return {"cmd": cmd, "extended": True, "kind": "tally_dump",
+                    "matrix": data[1], "level": data[2]}
         if cmd in (CMD_INTERROGATE, CMD_CONNECT):
             matrix, level = (data[1] & 0xF0) >> 4, data[1] & 0x0F
             mult = data[2]
@@ -390,8 +399,21 @@ def dual_status(status_byte=0x02):
 
 STD_SIGNAL_MAX = 1023      # multiplicateur sur 3 bits + reste sur 7 : 7×128 + 127
 
+# Jeu ÉTENDU des crosspoints (129 à 132). Matrice et niveau ont chacun leur octet, et les
+# numéros passent sur 16 bits — plus de multiplicateur, donc plus de plafond à 1023. C'est
+# la seule façon d'adresser notre plan au-delà du slot 10 (§12.2 : 100×slot + n → 1699).
+# Disposition reprise du module Companion `generic-swp08`, comme les commandes de noms :
+#   cmd · matrice · niveau · dest (2 octets) · source (2 octets)
+CMD_EXT_INTERROGATE = 0x81
+CMD_EXT_CONNECT = 0x82
+CMD_EXT_TALLY = 0x83
+CMD_EXT_CONNECTED = 0x84
+CMD_EXT_TALLY_DUMP_REQ = 0x95
+CMD_EXT_TALLY_DUMP_WORD = 0x97
+EXT_SIGNAL_MAX = 0xFFFF
 
-def tally(matrix, level, dest, source, *, connected=False):
+
+def tally(matrix, level, dest, source, *, connected=False, extended=False):
     """DATA d'un tally (03) ou d'un connected (04) — même disposition, seule la commande change.
 
     Le choix n'est PAS cosmétique : le `03` répond à un interrogate, le `04` confirme un
@@ -404,6 +426,14 @@ def tally(matrix, level, dest, source, *, connected=False):
     le slot 5, ce qui est pire qu'une absence. On refuse donc franchement, à charge de
     l'appelant de sauter ou de passer aux commandes étendues (129 à 132), que le pupitre
     déclare supporter et qui restent à implémenter."""
+    if extended:
+        for nom, v in (("destination", dest), ("source", source)):
+            if not (0 <= v <= EXT_SIGNAL_MAX):
+                raise ValueError("%s %d hors de portée (max %d)" % (nom, v, EXT_SIGNAL_MAX))
+        return bytes([CMD_EXT_CONNECTED if connected else CMD_EXT_TALLY,
+                      matrix & 0xFF, level & 0xFF,
+                      (dest >> 8) & 0xFF, dest & 0xFF,
+                      (source >> 8) & 0xFF, source & 0xFF])
     for nom, v in (("destination", dest), ("source", source)):
         if not (0 <= v <= STD_SIGNAL_MAX):
             raise ValueError("%s %d hors de portée des commandes standard (max %d)"
