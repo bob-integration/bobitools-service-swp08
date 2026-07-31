@@ -84,6 +84,10 @@
     "swp08_trace": {
       "type": "bool",
       "default": false
+    },
+    "swp08_refus_mode": {
+      "type": "text",
+      "default": "tally"
     }
   }
 }

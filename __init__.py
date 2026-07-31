@@ -276,6 +276,32 @@ _contributor = None          # type d'outil portant la couche IPG (déduit, jama
 TEST_SIZE = 8
 _test_tally = {n: n for n in range(1, TEST_SIZE + 1)}   # au départ, chaque dest sur sa source
 
+# Sources IMPOSSIBLES du banc d'essai. Le banc ne sert plus seulement à prouver que la boucle du
+# protocole tourne : il sert à éprouver le REFUS. Le matériel réel ne sait pas refuser sur
+# commande — il faut lui demander quelque chose de précisément impossible, ce qui dépend de son
+# câblage du moment et change sous nos pieds. Ici, la moitié haute des sources refuse toujours,
+# sans matériel, sans attente et sans effet de bord.
+TEST_REFUS_MIN = 5
+
+# Comment on refuse. Le protocole n'ayant pas de message « refusé » (§3.2.2 : le routeur fait la
+# route et répond CONNECTED), il faut détourner ce qu'il a. Réglable pour qu'on puisse comparer
+# les quatre au banc en quelques secondes, plutôt que de raisonner sur la spécification :
+#   tally — CONNECTED sur la source demandée, puis TALLY sur la réelle (cf. `_answer_xpt`)
+#   nak   — on REFUSE la trame elle-même (§7.2.2). Suppose de n'acquitter qu'après avoir
+#           tranché, alors qu'on acquitte d'ordinaire d'emblée : le pupitre retransmet cinq
+#           fois en l'absence d'acquittement, donc la décision doit être rapide.
+#   oor   — TALLY portant la source 1023, « reserved to indicate destination out of range »
+#           (§3.2.3). Seule valeur d'erreur de toute la famille crosspoint.
+#   muet  — on ne répond rien. Témoin, pour distinguer ce qui vient de nous de ce qui vient
+#           du pupitre.
+REFUS_MODES = ("tally", "nak", "oor", "muet")
+OOR_SOURCE = 1023               # base 0 sur le fil, comme tout le reste du protocole
+
+
+def _refus_mode():
+    v = str(settings.get("swp08_refus_mode") or "").strip().lower()
+    return v if v in REFUS_MODES else "tally"
+
 
 def test_matrix():
     """Numéro de matrice servant le banc d'essai, ou 0 si le mode test est éteint."""
@@ -482,7 +508,10 @@ def _build_model():
     out.setdefault(("in", "tally"), {})
     out.setdefault(("assign", "tally"), {})
     # Banc d'essai : indépendant du parc, donc toujours présent et toujours identique.
-    out[("test", "source")] = {n: "SRC %d" % n for n in range(1, TEST_SIZE + 1)}
+    # Les libellés DISENT lesquelles refusent : au pupitre on ne voit que des numéros, et un
+    # essai de refus qu'on croit avoir lancé sur une source acceptante ne prouve rien.
+    out[("test", "source")] = {n: "SRC %d %s" % (n, "KO" if n >= TEST_REFUS_MIN else "OK")
+                               for n in range(1, TEST_SIZE + 1)}
     out[("test", "dest")] = {n: "DST %d" % n for n in range(1, TEST_SIZE + 1)}
     out[("test", "tally")] = dict(_test_tally)
     return out, None
@@ -646,7 +675,9 @@ def _dual_status_byte():
 
 
 def _handle_routing(conn, addr, payload):
-    """Sert les commandes d'ÉTAT du routeur. Rend True si la trame a été traitée.
+    """Sert les commandes d'ÉTAT du routeur. Rend False si la trame n'est pas pour nous, True si
+    elle a été traitée, et la chaîne « nak » si elle a été traitée mais REFUSÉE — auquel cas
+    l'appelant refuse la trame au niveau liaison au lieu de l'acquitter.
 
     Sans elles, rien d'autre ne démarre : le pupitre interroge l'état du contrôleur (08) toutes
     les dix secondes et, faute de réponse, ne considère jamais le routeur comme vivant — donc
@@ -656,6 +687,7 @@ def _handle_routing(conn, addr, payload):
     écrire le même crosspoint donneraient deux vérités. Un `connect` reçu est donc refusé — mais
     en RÉPONDANT l'état vrai, pour que le point de croisement optimiste du pupitre claque en
     arrière au lieu de mentir (même règle qu'au §12.3 côté Ember+)."""
+    t0 = time.monotonic()       # arrivée de la trame — origine de la fenêtre d'occultation
     r = proto.decode_routing(payload)
     if not r:
         return False
@@ -676,23 +708,31 @@ def _handle_routing(conn, addr, payload):
         return True
     if r["kind"] == "connect":
         if etage == "test":
-            # Le banc d'essai ACCEPTE tout et le retient : c'est ce qui prouve que la boucle
-            # complète fonctionne — connect reçu, état modifié, `04` renvoyé, tally cohérent
-            # au dump suivant. Purement en mémoire, aucun matériel n'est touché.
+            # Le banc d'essai prouve la boucle complète — connect reçu, état modifié, `04`
+            # renvoyé, tally cohérent au dump suivant — en mémoire, sans toucher au matériel.
+            # Et depuis le 2026-07-31 il prouve aussi le REFUS, que le matériel ne sait pas
+            # produire sur commande : les sources à partir de `TEST_REFUS_MIN` refusent toujours.
             dest, src = r["dest"] + 1, (r["source"] or 0) + 1
-            if 1 <= dest <= TEST_SIZE and 1 <= src <= TEST_SIZE:
-                _test_tally[dest] = src
-                model(force=True)
-                log.info("swp08: %s — TEST dest %d ← src %d (accepté)", addr, dest, src)
-                _send_tally(conn, r["matrix"], r["level"], r["dest"],
-                                                   r["source"] or 0, connected=True)
-            else:
+            if not (1 <= dest <= TEST_SIZE and 1 <= src <= TEST_SIZE):
                 log.info("swp08: %s — TEST hors plage (dest %d, src %d, max %d)",
                          addr, dest, src, TEST_SIZE)
-        elif etage == "assign":
-            _apply_assign(conn, addr, r, tal)
-        else:
-            _apply_signal(conn, addr, r, tal)
+                return True
+            if src >= TEST_REFUS_MIN:
+                log.info("swp08: %s — TEST dest %d ← src %d : REFUSÉ (source impossible, "
+                         "mode « %s »)", addr, dest, src, _refus_mode())
+                _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"],
+                            r["source"] or 0, _test_tally.get(dest, dest) - 1)
+                return "nak" if _refus_mode() == "nak" else True
+            _test_tally[dest] = src
+            model(force=True)
+            log.info("swp08: %s — TEST dest %d ← src %d (accepté)", addr, dest, src)
+            _send_tally(conn, r["matrix"], r["level"], r["dest"],
+                        r["source"] or 0, connected=True)
+            return True
+        ok = _apply_assign(conn, addr, r, tal) if etage == "assign" \
+            else _apply_signal(conn, addr, r, tal)
+        if ok is False and _refus_mode() == "nak":
+            return "nak"
         return True
     if r["kind"] == "tally_dump":
         # Découpé en tranches CONTIGUËS de 64 : le format n'annonce qu'une destination de
@@ -729,7 +769,7 @@ def _apply_signal(conn, addr, r, tal):
     ipg_io, err = _ipg()
     if not plan or err:
         log.info("swp08: %s — layer %d sans grille canonique (%s)", addr, layer, err or "hors plan")
-        return
+        return True
     canon, ess = plan
     dec = ipg_io.AUDIO2_OFFSET if ess == "audio2" else 0
     if not _write_allowed(addr):
@@ -738,7 +778,7 @@ def _apply_signal(conn, addr, r, tal):
         if vrai is not None:
             _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"],
                         r["source"] or 0, vrai - 1)
-        return
+        return False
     # L'état du parc : celui du service Ember+, qui le tient à jour et le met en cache. Le
     # reconstruire ici coûterait plusieurs secondes par crosspoint.
     try:
@@ -747,17 +787,17 @@ def _apply_signal(conn, addr, r, tal):
         state = svc._io_state() if svc else None
     except Exception as e:
         log.warning("swp08: %s — état du parc indisponible : %s", addr, e)
-        return
+        return True
     if not state:
         log.info("swp08: %s — état du parc vide, commutation ignorée", addr)
-        return
+        return True
     tgt = r["dest"] + dec
     src = [(r["source"] or 0) + dec]
     try:
         ok, touche = ipg_io.apply_connect(canon, tgt, src, "connect", state)
     except Exception as e:
         log.warning("swp08: %s — commutation a levé : %s", addr, e)
-        return
+        return True
     log.info("swp08: %s — %s dest %d ← src %d : %s%s", addr, canon, r["dest"] + 1,
              (r["source"] or 0) + 1, "appliqué" if ok else "REFUSÉ par le matériel",
              " (%s)" % touche if touche else "")
@@ -782,6 +822,7 @@ def _apply_signal(conn, addr, r, tal):
         reel = (vrai - 1) if vrai is not None else (ipg_io.PSEUDO_NONE - 1)
     _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"], demande, reel)
     threading.Thread(target=notify_change, daemon=True).start()
+    return ok
 
 
 def _apply_assign(conn, addr, r, tal):
@@ -804,18 +845,18 @@ def _apply_assign(conn, addr, r, tal):
         if ancien is not None:
             _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"],
                         r["source"] or 0, ancien - 1)
-        return
+        return False
     if not bool(settings.get("swp08_allow_assign")):
         log.info("swp08: %s — affectation refusée (slot %d) : `swp08_allow_assign` est faux",
                  addr, slot)
         if ancien is not None:
             _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"],
                         r["source"] or 0, ancien - 1)
-        return
+        return False
     ipg_io, err = _ipg()
     if err or not _contributor:
         log.warning("swp08: %s — affectation impossible : %s", addr, err or "couche IPG absente")
-        return
+        return True
     src = (r["source"] or 0) + 1
     # Source 1 = « Disconnect » (PSEUDO_NONE) : c'est le geste qui VIDE le slot. Les matériels
     # commencent à 11 (DEV_SRC_OFFSET + 1), donc tout ce qui est en dessous vide.
@@ -827,7 +868,7 @@ def _apply_assign(conn, addr, r, tal):
                                   actor=SWP08_ACTOR, timeout=15)
     except Exception as e:
         log.warning("swp08: %s — renvoi de l'affectation a levé : %s", addr, e)
-        return
+        return True
     ok = status == 200 and isinstance(data, dict) and not data.get("error")
     if not ok:
         log.info("swp08: %s — affectation refusée par la couche IPG → %s %s", addr, status, data)
@@ -864,6 +905,7 @@ def _apply_assign(conn, addr, r, tal):
     # Les AUTRES clients, et surtout les libellés : un déplacement renumérote tout le matériel
     # concerné, donc ses noms changent aussi. En fond pour ne pas retarder la réponse.
     threading.Thread(target=notify_change, daemon=True).start()
+    return ok
 
 
 def _runs(nums):
@@ -911,11 +953,28 @@ def _serve_client(conn, addr):
                     continue
                 if kind in ("ack", "nak"):
                     continue            # acquittements du client : rien à faire de plus
-                _send(conn, proto.FRAME_ACK)
+                # D'ordinaire on acquitte AVANT de traiter : le pupitre retransmet cinq fois en
+                # l'absence d'acquittement, et une réponse lente ne doit pas passer pour une
+                # réponse perdue. Le mode « nak » impose l'inverse sur les seules commutations —
+                # refuser une trame qu'on vient d'acquitter n'aurait aucun sens. La décision
+                # doit donc être rendue avant que la retransmission ne parte : c'est tenable au
+                # banc d'essai, qui tranche en mémoire, et c'est bien pour ça qu'on l'y éprouve
+                # avant d'en faire quoi que ce soit sur du matériel.
+                differe = (_refus_mode() == "nak" and payload
+                           and payload[0] in (proto.CMD_CONNECT, proto.CMD_EXT_CONNECT))
+                if not differe:
+                    _send(conn, proto.FRAME_ACK)
                 if _absorb_names(addr, payload):
+                    if differe:
+                        _send(conn, proto.FRAME_ACK)
                     continue
-                if _handle_routing(conn, addr, payload):
+                verdict = _handle_routing(conn, addr, payload)
+                if verdict:
+                    if differe:
+                        _send(conn, proto.FRAME_NAK if verdict == "nak" else proto.FRAME_ACK)
                     continue
+                if differe:
+                    _send(conn, proto.FRAME_ACK)
                 req = proto.decode_request(payload)
                 if not req:
                     log.info("swp08: %s — commande %02X non gérée (ignorée)",
@@ -998,7 +1057,19 @@ def _answer_xpt(conn, t0, matrix, level, dest, demande, reel):
 
     Au pupitre, un refus passe donc au vert puis revient en arrière, la source demandée étant
     signalée mauvaise. Le MOTIF, lui, n'est lisible que dans le journal du service : le
-    protocole transporte un bit, pas une phrase."""
+    protocole transporte un bit, pas une phrase.
+
+    Un REFUS emprunte le mécanisme choisi par `swp08_refus_mode` ; seul « tally » suit la
+    description ci-dessus. Une RÉUSSITE ne dépend d'aucun mode : elle se confirme toujours."""
+    if reel != demande:
+        mode = _refus_mode()
+        if mode == "muet":
+            return True                     # témoin : on laisse le pupitre seul avec sa demande
+        if mode == "nak":
+            return True                     # la trame elle-même est refusée, cf. `_serve_client`
+        if mode == "oor":
+            _send_tally(conn, matrix, level, dest, OOR_SOURCE)
+            return True
     _send_tally(conn, matrix, level, dest, demande, connected=True, bad=reel != demande)
 
     def _dire_vrai():
