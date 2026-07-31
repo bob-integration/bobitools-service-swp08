@@ -392,8 +392,13 @@ def dual_status(status_byte=0x02):
 
     ⚠ La spec dit seulement « *Bit 1 of byte 1 of the response is then used to indicate whether
     the controller is active or idle* » — sans donner la valeur qui vaut « actif », ni si le
-    bit est compté depuis 0. On arme donc le bit d'index 1 (0x02) par défaut, et l'octet est
-    RÉGLABLE : si le pupitre nous croit inactif, c'est le premier bouton à tourner."""
+    bit est compté depuis 0. L'octet reste RÉGLABLE (`swp08_dual_status`), défaut 0x01 : « bit
+    1 » lu à la manière habituelle des documents Pro-Bel, c'est-à-dire le bit de poids faible.
+
+    Essai du 2026-07-31, à ne pas refaire : passer de 0x02 à 0x01 ne change RIEN au comportement
+    du pupitre visé. Il n'implémente pas la bascule double contrôleur du §11.5.2 — il n'a jamais
+    émis le moindre interrogate (01), ni avant ni après, et se sert du 08 comme d'un simple
+    maintien de liaison toutes les 9,5 s. Son état, il le prend par les dumps de tally (15)."""
     return bytes([CMD_DUAL_STATUS_RESP, status_byte & 0xFF])
 
 
@@ -413,8 +418,18 @@ CMD_EXT_TALLY_DUMP_WORD = 0x97
 EXT_SIGNAL_MAX = 0xFFFF
 
 
-def tally(matrix, level, dest, source, *, connected=False, extended=False):
+def tally(matrix, level, dest, source, *, connected=False, extended=False, bad=False):
     """DATA d'un tally (03) ou d'un connected (04) — même disposition, seule la commande change.
+
+    `bad` arme le bit 3 du multiplicateur : « TDM and Digital Video source "bad" status
+    (0 = good src) » (§8.1.1). C'est la SEULE façon qu'a le protocole de dire qu'un croisement
+    ne vaut rien — il n'y a pas de message « refusé », le §3.2.2 pose que le routeur fait la
+    route et répond CONNECTED. Émettre ce bit à zéro sur un refus, comme on l'a fait jusqu'au
+    2026-07-31, revient à affirmer au pupitre que la source est bonne : il n'a alors aucune
+    raison de lever son attente.
+
+    ⚠ Le jeu ÉTENDU n'a pas de multiplicateur (numéros sur 16 bits), donc pas de bit 3 : au-delà
+    de 1023, on ne sait pas signaler une mauvaise source. `_send_tally` le journalise.
 
     Le choix n'est PAS cosmétique : le `03` répond à un interrogate, le `04` confirme un
     connect (§8.2.1 et §8.2.2). Répondre l'un pour l'autre laisse le pupitre sans réponse —
@@ -439,7 +454,7 @@ def tally(matrix, level, dest, source, *, connected=False, extended=False):
             raise ValueError("%s %d hors de portée des commandes standard (max %d)"
                              % (nom, v, STD_SIGNAL_MAX))
     return bytes([CMD_CONNECTED if connected else CMD_TALLY, _mx(matrix, level),
-                  ((dest // 128) & 0x07) << 4 | ((source // 128) & 0x07),
+                  ((dest // 128) & 0x07) << 4 | (0x08 if bad else 0) | ((source // 128) & 0x07),
                   dest % 128, source % 128])
 
 

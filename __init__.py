@@ -125,6 +125,21 @@ def _suffixe(labels, essence, largeur):
 # niveau AFFICHÉ (base 1) → étage
 _STAGE_OF_LEVEL = {lvl: stage for lvl, stage, _ in LEVEL_PLAN}
 _ESSENCE_OF_LEVEL = {lvl: ess for lvl, _st, ess in LEVEL_PLAN}
+
+# Layer → grille canonique du plan IPG, et décalage d'essence. C'est `ipg_io.apply_connect` qui
+# applique réellement le crosspoint : il connaît les numéros émis, les essences, et sait refuser
+# ce que le matériel refuse. On ne retraduit rien ici — une seconde traduction serait une
+# seconde vérité, et c'est tout ce que ce projet passe son temps à supprimer.
+#
+# L'audio 2 vit au-dessus de tous les numéros de base (§12.10) : les grilles audio portent les
+# deux essences, séparées par ce décalage. Le layer, lui, les distingue déjà — on rajoute donc
+# le décalage AVANT d'appeler, pour parler la langue des grilles.
+_CANON_OF_LEVEL = {
+    1: ("video_in", 0), 2: ("video_out", 0),
+    3: ("audio_in", 0), 4: ("audio_out", 0),
+    5: ("audio_in", "audio2"), 6: ("audio_out", "audio2"),
+    7: ("anc_in", 0), 8: ("anc_out", 0),
+}
 DEFAULT_STAGE = "in"        # un niveau hors plan retombe sur l'étage d'entrée
 
 _lock = threading.Lock()
@@ -677,16 +692,7 @@ def _handle_routing(conn, addr, payload):
         elif etage == "assign":
             _apply_assign(conn, addr, r, tal)
         else:
-            # Les SIGNAUX ne se routent pas par ce canal : Ember+ le fait déjà, et deux
-            # protocoles autorisés à écrire le même crosspoint donneraient deux vérités. On
-            # répond quand même l'état réel — un `04` — pour que le point de croisement
-            # optimiste du pupitre claque en arrière au lieu de mentir (§12.3).
-            vrai = tal.get(r["dest"] + 1)
-            log.info("swp08: %s — connect REFUSÉ (dest %d ← src %d) : le routage des signaux "
-                     "passe par Ember+", addr, r["dest"] + 1, (r["source"] or 0) + 1)
-            if vrai is not None:
-                _send_tally(conn, r["matrix"], r["level"], r["dest"],
-                                                   vrai - 1, connected=True)
+            _apply_signal(conn, addr, r, tal)
         return True
     if r["kind"] == "tally_dump":
         # Découpé en tranches CONTIGUËS de 64 : le format n'annonce qu'une destination de
@@ -706,6 +712,78 @@ def _handle_routing(conn, addr, payload):
     return False
 
 
+def _apply_signal(conn, addr, r, tal):
+    """Commute un signal depuis le contrôleur (layers 1 à 8).
+
+    Le routage vit ICI depuis le 2026-07-31, et plus dans les matrices Ember+. La raison est
+    celle qui a fait choisir SW-P-08 : une matrice Ember+ se câble à la main au contrôleur,
+    exactement comme un paramètre, alors qu'un routeur s'ingère en bloc. Garder les deux
+    revenait à refaire le travail qu'on cherchait à éviter — et à entretenir deux vérités sur
+    le même crosspoint.
+
+    On ne retraduit rien : `ipg_io.apply_connect` connaît déjà les numéros émis, les essences
+    et les refus du matériel. Une seconde traduction serait une seconde vérité."""
+    t0 = time.monotonic()       # arrivée de la commande — origine de la fenêtre d'occultation
+    layer = r["matrix"] + 1
+    plan = _CANON_OF_LEVEL.get(layer)
+    ipg_io, err = _ipg()
+    if not plan or err:
+        log.info("swp08: %s — layer %d sans grille canonique (%s)", addr, layer, err or "hors plan")
+        return
+    canon, ess = plan
+    dec = ipg_io.AUDIO2_OFFSET if ess == "audio2" else 0
+    if not _write_allowed(addr):
+        log.warning("swp08: %s — commutation REFUSÉE : adresse hors de `swp08_write_allow`", addr)
+        vrai = tal.get(r["dest"] + 1)
+        if vrai is not None:
+            _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"],
+                        r["source"] or 0, vrai - 1)
+        return
+    # L'état du parc : celui du service Ember+, qui le tient à jour et le met en cache. Le
+    # reconstruire ici coûterait plusieurs secondes par crosspoint.
+    try:
+        from app import core_plugins
+        svc = core_plugins.module("emberplus")
+        state = svc._io_state() if svc else None
+    except Exception as e:
+        log.warning("swp08: %s — état du parc indisponible : %s", addr, e)
+        return
+    if not state:
+        log.info("swp08: %s — état du parc vide, commutation ignorée", addr)
+        return
+    tgt = r["dest"] + dec
+    src = [(r["source"] or 0) + dec]
+    try:
+        ok, touche = ipg_io.apply_connect(canon, tgt, src, "connect", state)
+    except Exception as e:
+        log.warning("swp08: %s — commutation a levé : %s", addr, e)
+        return
+    log.info("swp08: %s — %s dest %d ← src %d : %s%s", addr, canon, r["dest"] + 1,
+             (r["source"] or 0) + 1, "appliqué" if ok else "REFUSÉ par le matériel",
+             " (%s)" % touche if touche else "")
+    if ok:
+        audit_log("swp08", "connect", "%s dest %d ← src %d" % (canon, r["dest"] + 1,
+                                                               (r["source"] or 0) + 1),
+                  user_id=None, username=SWP08_ACTOR)
+    # ── Réponse, et c'est le point important ──────────────────────────────────────────
+    # Le contrôleur affiche son crosspoint dès le clic, en pariant sur le succès. Tant qu'on ne
+    # répond pas, il reste EN ATTENTE — et la rediffusion de fond met plusieurs secondes, le
+    # temps de reconstruire le modèle. Un refus doit donc être annoncé sans attendre celle-ci,
+    # sinon l'opérateur croit que ça a marché (§12.3). Le comment est dans `_answer_xpt` : le
+    # protocole n'ayant pas de refus, on lève l'attente puis on dément.
+    #
+    # Dans les deux cas la rediffusion qui suit confirmera sur l'état relu du matériel, qui
+    # reste seul juge.
+    demande = r["source"] or 0
+    if ok:
+        reel = demande
+    else:
+        vrai = tal.get(r["dest"] + 1)
+        reel = (vrai - 1) if vrai is not None else (ipg_io.PSEUDO_NONE - 1)
+    _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"], demande, reel)
+    threading.Thread(target=notify_change, daemon=True).start()
+
+
 def _apply_assign(conn, addr, r, tal):
     """Pose un matériel sur un slot depuis le pupitre (layer « affectation »).
 
@@ -717,20 +795,22 @@ def _apply_assign(conn, addr, r, tal):
     sur ses connecteurs, et son sous-arbre Ember+ change de chemin). Le §12.8 décrit ça comme
     un déménagement hors service, pas un geste de production. C'est un pouvoir réel qu'on donne
     au pupitre, d'où le réglage `swp08_allow_assign` pour le retirer en exploitation."""
+    t0 = time.monotonic()       # arrivée de la commande — origine de la fenêtre d'occultation
     slot = r["dest"] + 1
     ancien = tal.get(slot)
     if not _write_allowed(addr):
         log.warning("swp08: %s — affectation REFUSÉE : adresse hors de `swp08_write_allow`",
                     addr)
         if ancien is not None:
-            _send_tally(conn, r["matrix"], r["level"], r["dest"], ancien - 1, connected=True)
+            _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"],
+                        r["source"] or 0, ancien - 1)
         return
     if not bool(settings.get("swp08_allow_assign")):
         log.info("swp08: %s — affectation refusée (slot %d) : `swp08_allow_assign` est faux",
                  addr, slot)
         if ancien is not None:
-            _send_tally(conn, r["matrix"], r["level"], r["dest"],
-                                               ancien - 1, connected=True)
+            _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"],
+                        r["source"] or 0, ancien - 1)
         return
     ipg_io, err = _ipg()
     if err or not _contributor:
@@ -765,6 +845,12 @@ def _apply_assign(conn, addr, r, tal):
     # son ancien slot se vide. Ne confirmer que la destination demandée laisserait le pupitre
     # afficher le matériel à deux endroits — ce qui est justement l'état que le modèle interdit.
     # On renvoie donc un `04` pour CHAQUE slot dont l'occupant a changé.
+    # Refus : rien n'a changé, donc la boucle ci-dessous n'annoncerait RIEN — et le pupitre
+    # resterait en attente sur le slot demandé. On le détrompe explicitement, sur son état réel.
+    if not ok:
+        vrai = apres.get(slot)
+        _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"], r["source"] or 0,
+                    (vrai if vrai is not None else ipg_io.PSEUDO_NONE) - 1)
     for s in sorted(set(tal) | set(apres)):
         avant, maintenant = tal.get(s), apres.get(s)
         if avant == maintenant:
@@ -811,6 +897,12 @@ def _serve_client(conn, addr):
             if not chunk:
                 break
             buf += chunk
+            if bool(settings.get("swp08_trace")):
+                # Trace BRUTE, réglage `swp08_trace`. Éteinte par défaut : elle journalise tout
+                # ce qui entre, y compris les battements de cœur, donc elle noie le journal.
+                # Elle existe parce qu'un « il ne se passe rien » a deux causes indiscernables —
+                # le contrôleur n'envoie rien, ou nous ne comprenons pas ce qu'il envoie.
+                log.info("swp08: %s ← %s", addr, proto.hexstring(chunk[:64]))
             events, buf = proto.unpack(buf)
             for kind, payload in events:
                 if kind == "erreur":
@@ -852,7 +944,18 @@ def _serve_client(conn, addr):
             _status["clients"] = len(_clients)
 
 
+# Commandes dont on NE trace PAS l'émission : les libellés. Une rediffusion en pousse plus de
+# quinze cents d'un coup, ce qui noierait le seul trafic qu'on cherche à lire.
+_TRACE_MUETTES = frozenset((proto.CMD_SOURCE_NAMES_RESPONSE, proto.CMD_DEST_NAMES_RESPONSE,
+                            proto.CMD_UMD_LABELS_RESPONSE, proto.CMD_EXT_SOURCE_NAMES_RESPONSE,
+                            proto.CMD_EXT_DEST_NAMES_RESPONSE))
+
+
 def _send(conn, data):
+    # Trace du SORTANT. Elle a manqué longtemps, et ça coûte cher : jusqu'au 2026-07-31 on a
+    # raisonné sur des trames qu'on n'avait jamais lues, en supposant correct ce qu'on émettait.
+    if bool(settings.get("swp08_trace")) and len(data) > 3 and data[2] not in _TRACE_MUETTES:
+        log.info("swp08: → %s", proto.hexstring(data[:32]))
     try:
         conn.sendall(data)
         return True
@@ -861,10 +964,67 @@ def _send(conn, data):
         return False
 
 
+# Le contrôleur OCCULTE les tallies pendant « approx. 100mS » après avoir émis une commutation
+# (SW-P-88 §7.1) : il affiche d'emblée ce qu'il a demandé, et jette les tallies de cette fenêtre
+# pour qu'un message en vol n'écrase pas son pari. C'est ce qui date le DÉMENTI de `_answer_xpt`
+# — envoyé plus tôt, il serait jeté.
+#
+# Attention à ne pas relire cette constante comme l'explication du refus resté en attente : elle
+# ne l'était pas. Attendre la fin de la fenêtre AVANT d'annoncer la source réelle a été essayé le
+# 2026-07-31 et n'a rien changé, y compris sur un refus parti sept secondes après la commande.
+# La marge est large parce que le pupitre ne publie pas la sienne et que la spécification ne
+# donne qu'un ordre de grandeur.
+XPT_BLANKING_S = 0.6
+
+
+def _answer_xpt(conn, t0, matrix, level, dest, demande, reel):
+    """Répond à une commutation, en DEUX temps. Chemin unique : une réussite se confirme, un
+    refus se dément, et `reel == demande` distingue les deux sans brancher.
+
+    SW-P-08 n'a pas de message « refusé » — le §3.2.2 pose que le routeur fait la route et
+    répond CONNECTED ; l'échec n'est pas au modèle. Et un CONNECTED portant la source RÉELLE ne
+    suffit pas : mesuré au banc le 2026-07-31, le pupitre l'acquitte puis l'ignore, y compris
+    envoyé sept secondes après la commande. Il n'accepte un CONNECTED que s'il annonce ce qu'il
+    a demandé.
+
+    D'où les deux temps :
+      1. CONNECTED sur la source DEMANDÉE — le pupitre lève son attente. En cas de refus, ce
+         message porte le bit « source mauvaise » du §8.1.1 : c'est LUI qui refuse, et c'est la
+         seule primitive de refus du protocole. L'avoir laissé à zéro affirmait au pupitre que
+         la source était bonne, ce qui expliquait qu'il n'en tienne aucun compte ;
+      2. TALLY sur la source RÉELLE, une fois passée la fenêtre d'occultation du §7.1
+         (« approx. 100mS » pendant lesquelles il jette les tallies, pour qu'un message en vol
+         n'écrase pas son propre pari) — il écrase alors sa table avec la vérité.
+
+    Au pupitre, un refus passe donc au vert puis revient en arrière, la source demandée étant
+    signalée mauvaise. Le MOTIF, lui, n'est lisible que dans le journal du service : le
+    protocole transporte un bit, pas une phrase."""
+    _send_tally(conn, matrix, level, dest, demande, connected=True, bad=reel != demande)
+
+    def _dire_vrai():
+        reste = XPT_BLANKING_S - (time.monotonic() - t0)
+        if reste > 0:
+            time.sleep(reste)
+        # TALLY d'abord : c'est lui qui ramène la table du pupitre à la vérité, mesuré au banc.
+        _send_tally(conn, matrix, level, dest, reel, connected=False)
+        if reel == demande:
+            return
+        # Puis CONNECTED, et seulement en cas d'écart. Le TALLY corrige la table mais laisse le
+        # pupitre marquer la source DEMANDÉE en attente — il se souvient de l'intention de
+        # l'opérateur, pas seulement de l'état. Le §3.2.4 fait du CONNECTED le message émis
+        # « après avoir établi une route » : c'est le seul qui affirme une route COURANTE, donc
+        # le seul candidat pour solder cette intention. S'il est ignoré comme l'ont été nos
+        # CONNECTED isolés, on ne perd rien — la table reste juste, corrigée par le TALLY.
+        _send_tally(conn, matrix, level, dest, reel, connected=True)
+
+    threading.Thread(target=_dire_vrai, daemon=True).start()
+    return True
+
+
 _hors_portee = set()        # numéros déjà signalés, pour ne pas noyer le journal
 
 
-def _send_tally(conn, matrix, level, dest, source, *, connected=False):
+def _send_tally(conn, matrix, level, dest, source, *, connected=False, bad=False):
     """Émet un tally/connected, ou RENONCE si les numéros dépassent ce que les commandes
     standard savent adresser (1023, cf. `proto.tally`). Renoncer bruyamment vaut mieux que
     replier en silence : au-delà du slot 10, le pupitre afficherait des croisements sur les
@@ -874,9 +1034,14 @@ def _send_tally(conn, matrix, level, dest, source, *, connected=False):
     # les commandes de noms. Basculer tout le parc dessus risquerait de casser ce qui marche
     # pour un gain nul en dessous de 1024.
     ext = max(dest, source) > proto.STD_SIGNAL_MAX
+    if bad and ext:
+        # Le jeu étendu n'a pas de multiplicateur, donc pas de bit « source mauvaise ». On le
+        # dit plutôt que de laisser croire à un refus signalé.
+        log.warning("swp08: refus NON signalable au-delà de %d (dest %d, source %d) — le jeu "
+                    "étendu n'a pas de bit « source mauvaise »", proto.STD_SIGNAL_MAX, dest, source)
     try:
         return _send(conn, proto.pack(proto.tally(matrix, level, dest, source,
-                                                  connected=connected, extended=ext)))
+                                                  connected=connected, extended=ext, bad=bad)))
     except ValueError as e:
         cle = (dest, source)
         if cle not in _hors_portee:

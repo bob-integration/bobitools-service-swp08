@@ -47,7 +47,7 @@
     },
     "swp08_dual_status": {
       "type": "int",
-      "default": 2
+      "default": 1
     },
     "swp08_test": {
       "type": "bool",
@@ -80,6 +80,10 @@
     "swp08_write_allow": {
       "type": "text",
       "default": ""
+    },
+    "swp08_trace": {
+      "type": "bool",
+      "default": false
     }
   }
 }
