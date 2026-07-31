@@ -335,6 +335,8 @@ CMD_INTERROGATE = 0x01
 CMD_CONNECT = 0x02
 CMD_TALLY = 0x03
 CMD_CONNECTED = 0x04
+CMD_PROTO_IMPL_REQ = 0x61          # « quelles commandes sais-tu faire ? » (§10.1)
+CMD_PROTO_IMPL_RESP = 0x62         # la liste, un octet par commande servie
 CMD_DUAL_STATUS_REQ = 0x08
 CMD_DUAL_STATUS_RESP = 0x09
 CMD_TALLY_DUMP_REQ = 0x15          # 21 décimal
@@ -361,6 +363,8 @@ def decode_routing(data):
     try:
         if cmd == CMD_DUAL_STATUS_REQ:
             return {"cmd": cmd, "kind": "dual_status"}
+        if cmd == CMD_PROTO_IMPL_REQ:
+            return {"cmd": cmd, "kind": "proto_impl"}
         if cmd == CMD_TALLY_DUMP_REQ:
             return {"cmd": cmd, "kind": "tally_dump",
                     "matrix": (data[1] & 0xF0) >> 4, "level": data[1] & 0x0F}
@@ -385,6 +389,16 @@ def decode_routing(data):
     except IndexError:
         return None
     return None
+
+
+def proto_impl(commandes):
+    """DATA de la réponse d'implémentation (62) : la liste BRUTE des commandes servies, un octet
+    chacune (§10.1). Le §10 précise qu'« *il n'y a pas de champ message* » dans la requête 61 et
+    que « *les commandes implémentées, et donc la réponse, varient selon les applications* ».
+
+    Le pupitre visé ne la demande jamais — elle est là pour un contrôleur qui, lui, s'enquerrait
+    avant de parler, plutôt que de découvrir nos silences un par un."""
+    return bytes([CMD_PROTO_IMPL_RESP] + [c & 0xFF for c in commandes])
 
 
 def dual_status(status_byte=0x02):

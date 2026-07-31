@@ -88,6 +88,10 @@
     "swp08_refus_mode": {
       "type": "text",
       "default": "tally"
+    },
+    "swp08_dementi_ms": {
+      "type": "int",
+      "default": 600
     }
   }
 }

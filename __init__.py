@@ -674,6 +674,25 @@ def _dual_status_byte():
     return _int_setting("swp08_dual_status", 0x02, 0, 255)
 
 
+# Les commandes qu'on sert vraiment, dans l'ordre du §10.1. NE PAS y ajouter ce qu'on ne
+# traite pas : la réponse 62 est une promesse, et un contrôleur qui s'y fie enverrait alors des
+# trames qu'on ignorerait en silence. Manquent volontairement les salvos (120 à 125) et le dump
+# BYTE (22), non implémentés.
+SERVED_COMMANDS = (
+    proto.CMD_INTERROGATE, proto.CMD_CONNECT, proto.CMD_TALLY, proto.CMD_CONNECTED,
+    proto.CMD_DUAL_STATUS_REQ, proto.CMD_DUAL_STATUS_RESP,
+    proto.CMD_TALLY_DUMP_REQ, proto.CMD_TALLY_DUMP_WORD,
+    proto.CMD_PROTO_IMPL_REQ, proto.CMD_PROTO_IMPL_RESP,
+    proto.CMD_GET_SOURCE_NAMES, proto.CMD_GET_DEST_NAMES,
+    proto.CMD_SOURCE_NAMES_RESPONSE, proto.CMD_DEST_NAMES_RESPONSE,
+    proto.CMD_EXT_INTERROGATE, proto.CMD_EXT_CONNECT,
+    proto.CMD_EXT_TALLY, proto.CMD_EXT_CONNECTED,
+    proto.CMD_EXT_TALLY_DUMP_REQ,
+    proto.CMD_EXT_GET_SOURCE_NAMES, proto.CMD_EXT_GET_DEST_NAMES,
+    proto.CMD_EXT_SOURCE_NAMES_RESPONSE, proto.CMD_EXT_DEST_NAMES_RESPONSE,
+)
+
+
 def _handle_routing(conn, addr, payload):
     """Sert les commandes d'ÉTAT du routeur. Rend False si la trame n'est pas pour nous, True si
     elle a été traitée, et la chaîne « nak » si elle a été traitée mais REFUSÉE — auquel cas
@@ -693,6 +712,13 @@ def _handle_routing(conn, addr, payload):
         return False
     if r["kind"] == "dual_status":
         _send(conn, proto.pack(proto.dual_status(_dual_status_byte())))
+        return True
+    if r["kind"] == "proto_impl":
+        # Ce qu'on sert RÉELLEMENT, pas ce que la spec définit. Le pupitre visé ne le demande
+        # jamais (aucune trame 61 relevée), mais un contrôleur qui s'enquiert avant de parler
+        # mérite une réponse exacte plutôt que notre silence.
+        _send(conn, proto.pack(proto.proto_impl(SERVED_COMMANDS)))
+        log.info("swp08: %s — implémentation demandée → %d commande(s)", addr, len(SERVED_COMMANDS))
         return True
     tables, err = model()
     if err:
@@ -728,6 +754,16 @@ def _handle_routing(conn, addr, payload):
             log.info("swp08: %s — TEST dest %d ← src %d (accepté)", addr, dest, src)
             _send_tally(conn, r["matrix"], r["level"], r["dest"],
                         r["source"] or 0, connected=True)
+            # Et à TOUS les autres clients, en diffusion spontanée (§8.2.2). Sans ça un banc à
+            # plusieurs pupitres ment : celui qui n'a pas commuté continue d'afficher l'ancienne
+            # source. C'est aussi ce qui permet de provoquer, depuis la machine, un changement
+            # que le pupitre voit arriver « d'ailleurs » — le seul moyen d'éprouver comment il
+            # traite un croisement modifié par un tiers.
+            with _lock:
+                autres = [c for a, c in _clients.items() if c is not conn]
+            for c in autres:
+                _send_tally(c, r["matrix"], r["level"], r["dest"],
+                            r["source"] or 0, connected=True)
             return True
         ok = _apply_assign(conn, addr, r, tal) if etage == "assign" \
             else _apply_signal(conn, addr, r, tal)
@@ -1037,30 +1073,29 @@ XPT_BLANKING_S = 0.6
 
 
 def _answer_xpt(conn, t0, matrix, level, dest, demande, reel):
-    """Répond à une commutation, en DEUX temps. Chemin unique : une réussite se confirme, un
-    refus se dément, et `reel == demande` distingue les deux sans brancher.
+    """Répond à une commutation en annonçant l'état RÉEL, et rien d'autre. Chemin unique : une
+    réussite se confirme, un refus annonce ce qui est resté en place.
 
-    SW-P-08 n'a pas de message « refusé » — le §3.2.2 pose que le routeur fait la route et
-    répond CONNECTED ; l'échec n'est pas au modèle. Et un CONNECTED portant la source RÉELLE ne
-    suffit pas : mesuré au banc le 2026-07-31, le pupitre l'acquitte puis l'ignore, y compris
-    envoyé sept secondes après la commande. Il n'accepte un CONNECTED que s'il annonce ce qu'il
-    a demandé.
+    ⚠ **Le pupitre n'a pas de case pour un refus, et on a cherché longtemps.** Ce qu'il affiche
+    en attente n'est pas une commande non soldée qu'une trame pourrait clore : c'est l'affichage
+    permanent de « demandé ≠ réel ». Trois mesures indépendantes du 2026-07-31 le montrent — la
+    marque APPARAÎT au clic alors qu'on n'émet rien (mode « muet ») ; elle S'EFFACE si on
+    confirme la source demandée ; elle REVIENT dès qu'on annonce une autre source, à 600 ms
+    comme à 12 s, avec ou sans TALLY préalable. Il n'existe donc aucune trame qui distingue « la
+    demande est abandonnée » de « l'état diffère », parce que pour lui c'est la même chose.
 
-    D'où les deux temps :
-      1. CONNECTED sur la source DEMANDÉE — le pupitre lève son attente. En cas de refus, ce
-         message porte le bit « source mauvaise » du §8.1.1 : c'est LUI qui refuse, et c'est la
-         seule primitive de refus du protocole. L'avoir laissé à zéro affirmait au pupitre que
-         la source était bonne, ce qui expliquait qu'il n'en tienne aucun compte ;
-      2. TALLY sur la source RÉELLE, une fois passée la fenêtre d'occultation du §7.1
-         (« approx. 100mS » pendant lesquelles il jette les tallies, pour qu'un message en vol
-         n'écrase pas son propre pari) — il écrase alors sa table avec la vérité.
+    Conséquence pratique, et c'est le choix qu'on assume : **on ne ment pas**. Confirmer d'abord
+    la source demandée pour lever la marque, puis se dédire, a été essayé — le pupitre affiche
+    alors un succès pendant tout le délai, puis retombe à l'orange. On y gagnait un mensonge et
+    rien d'autre. Une seule trame part donc, portant la vérité.
 
-    Au pupitre, un refus passe donc au vert puis revient en arrière, la source demandée étant
-    signalée mauvaise. Le MOTIF, lui, n'est lisible que dans le journal du service : le
-    protocole transporte un bit, pas une phrase.
+    Le §15.12 de EMBERPLUS-IPG.md tient le détail des essais, à lire AVANT d'en tenter d'autres :
+    quatre mécanismes de refus, un témoin muet, contrôleur actif, `Acknowledge First` et
+    `Honor Acknowledge` armés. Le vrai correctif est en amont — ne pas produire de commutation
+    insatisfaisable — et il ne se joue pas dans ce fichier.
 
-    Un REFUS emprunte le mécanisme choisi par `swp08_refus_mode` ; seul « tally » suit la
-    description ci-dessus. Une RÉUSSITE ne dépend d'aucun mode : elle se confirme toujours."""
+    `swp08_refus_mode` garde les mécanismes éprouvés, pour un pupitre qui, lui, en tiendrait
+    compte. Ils sont sans effet sur celui-ci."""
     if reel != demande:
         mode = _refus_mode()
         if mode == "muet":
@@ -1070,25 +1105,22 @@ def _answer_xpt(conn, t0, matrix, level, dest, demande, reel):
         if mode == "oor":
             _send_tally(conn, matrix, level, dest, OOR_SOURCE)
             return True
-    _send_tally(conn, matrix, level, dest, demande, connected=True, bad=reel != demande)
 
-    def _dire_vrai():
-        reste = XPT_BLANKING_S - (time.monotonic() - t0)
+    def _annoncer():
+        # Jamais avant la fin de la fenêtre d'occultation du §7.1 : le pupitre jette les retours
+        # des ~100 ms qui suivent sa commande, donc répondre plus tôt revient à ne pas répondre.
+        # `swp08_dementi_ms` permet d'allonger encore, ce qui n'a servi qu'aux essais.
+        cible = max(XPT_BLANKING_S, _int_setting("swp08_dementi_ms", 600, 0, 60000) / 1000.0)
+        reste = cible - (time.monotonic() - t0)
         if reste > 0:
             time.sleep(reste)
-        # TALLY d'abord : c'est lui qui ramène la table du pupitre à la vérité, mesuré au banc.
-        _send_tally(conn, matrix, level, dest, reel, connected=False)
-        if reel == demande:
-            return
-        # Puis CONNECTED, et seulement en cas d'écart. Le TALLY corrige la table mais laisse le
-        # pupitre marquer la source DEMANDÉE en attente — il se souvient de l'intention de
-        # l'opérateur, pas seulement de l'état. Le §3.2.4 fait du CONNECTED le message émis
-        # « après avoir établi une route » : c'est le seul qui affirme une route COURANTE, donc
-        # le seul candidat pour solder cette intention. S'il est ignoré comme l'ont été nos
-        # CONNECTED isolés, on ne perd rien — la table reste juste, corrigée par le TALLY.
+        # UN SEUL CONNECTED, exactement ce qu'émet `_notify_once`. Le §8.2.2 en fait le message
+        # « issued spontaneously by the controller on all ports » : il AFFIRME une route, il ne
+        # se compare à rien. Le TALLY, lui, est la réponse à une interrogation d'état (§8.2.1),
+        # que le pupitre confronte à ce qu'il a commandé — on n'en émet donc pas ici.
         _send_tally(conn, matrix, level, dest, reel, connected=True)
 
-    threading.Thread(target=_dire_vrai, daemon=True).start()
+    threading.Thread(target=_annoncer, daemon=True).start()
     return True
 
 
