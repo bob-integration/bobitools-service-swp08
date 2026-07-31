@@ -390,15 +390,23 @@ def decode_routing(data):
 def dual_status(status_byte=0x02):
     """DATA de la réponse d'état du contrôleur (09).
 
-    ⚠ La spec dit seulement « *Bit 1 of byte 1 of the response is then used to indicate whether
-    the controller is active or idle* » — sans donner la valeur qui vaut « actif », ni si le
-    bit est compté depuis 0. L'octet reste RÉGLABLE (`swp08_dual_status`), défaut 0x01 : « bit
-    1 » lu à la manière habituelle des documents Pro-Bel, c'est-à-dire le bit de poids faible.
+    La spec dit seulement « *Bit 1 of byte 1 of the response is then used to indicate whether the
+    controller is active or idle* » — sans donner la valeur qui vaut « actif », ni si le bit est
+    compté depuis 0. **Tranché au banc le 2026-07-31 : 0x02 est ACTIF, 0x01 est INACTIF.** Le
+    pupitre le dit lui-même, en toutes lettres — « connected to idle card », puis « connected to
+    active card » une fois l'octet rétabli.
 
-    Essai du 2026-07-31, à ne pas refaire : passer de 0x02 à 0x01 ne change RIEN au comportement
-    du pupitre visé. Il n'implémente pas la bascule double contrôleur du §11.5.2 — il n'a jamais
-    émis le moindre interrogate (01), ni avant ni après, et se sert du 08 comme d'un simple
-    maintien de liaison toutes les 9,5 s. Son état, il le prend par les dumps de tally (15)."""
+    ⚠ **Ne pas mettre 0x01 pour se conformer à une lecture « bit de poids faible ».** L'essai a
+    été fait, et il empoisonne tout ce qui suit : déclaré inactif, le pupitre CESSE de demander
+    ses dumps de tally à la connexion (aucune demande entre 10:20 et 11:05, contre une par
+    connexion avant et après) et n'accorde plus le même traitement à ce qu'on lui répond. Trois
+    heures de mesures sur le refus des croisements ont dû être refaites pour cette seule raison.
+    Le réglage `swp08_dual_status` existe pour un pupitre qui lirait le bit autrement — pas pour
+    corriger celui-ci.
+
+    Le §11.5.2 décrit une bascule double contrôleur que ce pupitre n'implémente pas : il n'émet
+    jamais d'interrogate (01) et se sert du 08 comme d'un maintien de liaison toutes les 9,5 s.
+    Mais il LIT bien cette réponse, et il agit dessus."""
     return bytes([CMD_DUAL_STATUS_RESP, status_byte & 0xFF])
 
 
