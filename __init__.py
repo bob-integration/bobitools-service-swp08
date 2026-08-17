@@ -513,6 +513,10 @@ def _build_model():
     out[("test", "source")] = {n: "SRC %d %s" % (n, "KO" if n >= TEST_REFUS_MIN else "OK")
                                for n in range(1, TEST_SIZE + 1)}
     out[("test", "dest")] = {n: "DST %d" % n for n in range(1, TEST_SIZE + 1)}
+    # Table UMD PROPRE au banc. En exploitation, une demande de libellés UMD est servie avec la
+    # table des sources (cf. `responses_for`) : c'est un repli utile, mais il rend l'UMD
+    # indiscernable du nom de source — donc intestable. Ici elle existe pour elle-même.
+    out[("test", "umd")] = {n: "UMD %d" % n for n in range(1, TEST_SIZE + 1)}
     out[("test", "tally")] = dict(_test_tally)
     return out, None
 
@@ -538,6 +542,52 @@ def _stage_of(matrix_displayed, level_displayed=1):
     return st or DEFAULT_STAGE
 
 
+# Têtes de libellé du banc, par canal et par largeur : court (4), moyen (8), long (12).
+_TEST_CANAL = {"dest": ("D", "DST", "DEST"),
+               "source": ("S", "SRC", "SRCE"),
+               "umd": ("U", "UMD", "UMDL")}
+
+
+TEST_LABEL_LEVELS = 16     # VSM annonce 16 « Source Label » et 16 « Target Label » : on les remplit tous
+
+
+def test_level():
+    """Niveau UNIQUE sur lequel pousser les libellés du banc, ou -1 pour les seize.
+
+    C'est l'essai qui DISCRIMINE. Pousser les seize niveaux ne dit rien : le contrôleur affiche
+    le dernier arrivé, qu'il range par niveau ou qu'il écrase. Pousser un SEUL niveau, et un
+    seul qui ne soit pas le 0, sépare les deux hypothèses sans ambiguïté :
+      • rien ne s'affiche  → le niveau est honoré en réception, et seul le 0 est cartographié ;
+      • « L05 » s'affiche  → le champ niveau est ignoré en réception, le dernier écrit gagne.
+    Une mesure vaut mieux que deux lectures d'une documentation qui, elle, parle de ce que le
+    contrôleur ÉMET (« is NOT sent anymore »), pas de ce qu'il ingère."""
+    return _int_setting("swp08_test_level", -1, -1, TEST_LABEL_LEVELS - 1)
+
+
+def _test_labels(labels, req):
+    """Libellés du banc qui DISENT leur propre origine.
+
+    « DEST12X 3 » se lit : table des DESTINATIONS, demandée en 12 caractères, jeu de commandes
+    ÉTENDU, signal 3. L'écran du contrôleur répond alors tout seul aux deux questions qu'on ne
+    peut pas trancher depuis le serveur — QUELLE table il affiche, et à QUELLE largeur il la
+    demande. Sans ça, trois tables qui renvoient la même chaîne sont indiscernables une fois
+    affichées, et l'on croit lire l'UMD alors qu'on lit les sources.
+
+    C'est aussi la seule façon d'éprouver la piste « plusieurs niveaux de libellés » : si le
+    pupitre demande successivement 4, 8 et 12, il montrera trois chaînes différentes."""
+    kind = req["kind"] if req["kind"] in _TEST_CANAL else "source"
+    w = req["char_length"]
+    lvl = int(req.get("level") or 0) + 1        # base 1, comme au menu du contrôleur
+    court, moyen, long_ = _TEST_CANAL[kind]
+    if w <= 4:
+        motif = "%s%d%%d" % (court, lvl)
+    elif w <= 8:
+        motif = "%sL%02d %%d" % (moyen, lvl)
+    else:
+        motif = "%s L%02d %%d" % (long_, lvl)
+    return {n: (motif % n)[:w] for n in labels}
+
+
 def responses_for(req, tables=None):
     """Liste de trames prêtes à partir, répondant à une demande décodée par `proto`.
 
@@ -549,9 +599,17 @@ def responses_for(req, tables=None):
         if err:
             return [], err
     etage = _stage_of(req["matrix"] + 1, req["level"] + 1)   # le fil est en base 0 (§10.3)
-    role = "dest" if req["kind"] == "dest" else "source"
-    labels = _suffixe(tables.get((etage, role)) or {},
+    # Les libellés UMD sont une table À PART dans le protocole (0x68), pas une vue des noms de
+    # sources. On la sert quand elle existe, et on retombe sur les sources sinon — le repli
+    # d'origine, qu'on garde pour ne rien changer au parc IPG.
+    role = req["kind"] if req["kind"] in ("dest", "umd") else "source"
+    table = tables.get((etage, role))
+    if table is None and role == "umd":
+        table = tables.get((etage, "source"))
+    labels = _suffixe(table or {},
                       _ESSENCE_OF_LEVEL.get(req["matrix"] + 1), label_chars())
+    if etage == "test":
+        labels = _test_labels(labels, req)
     if not labels:
         return [], None
     data_list = proto.name_responses(
@@ -616,11 +674,24 @@ def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
         if err:
             return 0
     n = 0
-    for layer, _stage, _ess in LEVEL_PLAN:
+    # Le banc n'est PAS dans LEVEL_PLAN : ses libellés n'étaient donc jamais poussés, et comme
+    # ce pupitre ne demande jamais rien (cf. ci-dessus), le banc était injoignable pour tout ce
+    # qui touche au nommage. On l'ajoute à la tournée quand il est allumé — c'est la seule façon
+    # de lui faire afficher quoi que ce soit.
+    tournee = list(LEVEL_PLAN)
+    if test_matrix():
+        tournee = tournee + [(test_matrix(), "test", None)]
+    for layer, _stage, _ess in tournee:
         if matrices_wanted and layer not in matrices_wanted:
             continue
         etage = _stage_of(layer)
-        for kind, role in (("source", "source"), ("dest", "dest")):
+        # L'UMD n'est poussé que là où une table lui est propre — aujourd'hui le banc. Le pousser
+        # ailleurs enverrait les noms de sources en double sous un troisième code, ce qui
+        # brouillerait justement la mesure qu'on cherche à faire.
+        canaux = (("source", "source"), ("dest", "dest"))
+        if tables.get((etage, "umd")):
+            canaux = canaux + (("umd", "umd"),)
+        for kind, role in canaux:
             labels = _suffixe(dict(tables.get((etage, role)) or {}),
                               _ESSENCE_OF_LEVEL.get(layer), label_chars())
             cle = (layer, kind)
@@ -634,12 +705,27 @@ def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
                     labels[orphelin] = ""
             if not labels:
                 continue
-            for data in proto.name_responses(kind, labels, matrix=layer - 1, level=0,
-                                             char_length=label_chars(), extended=False,
-                                             first=1):
-                if not _send(conn, proto.pack(data)):
-                    return n
-                n += 1
+            # Le NIVEAU des commandes de noms est un second index de libellé, distinct du
+            # routage : le contrôleur annonce 16 « Source Label » et 16 « Target Label », soit
+            # exactement les 16 valeurs du quartet. On n'a jamais poussé que le niveau 1 —
+            # `level=0` en dur — donc quinze rangées de libellés sont restées vides depuis le
+            # début. Le banc les remplit toutes, avec des chaînes qui disent leur niveau, pour
+            # voir lesquelles le contrôleur expose réellement.
+            if etage != "test":
+                niveaux = (0,)
+            else:
+                tl = test_level()
+                niveaux = range(TEST_LABEL_LEVELS) if tl < 0 else (tl,)
+            for niv in niveaux:
+                envoi = (_test_labels(labels, {"kind": kind, "char_length": label_chars(),
+                                               "extended": False, "level": niv})
+                         if etage == "test" else labels)
+                for data in proto.name_responses(kind, envoi, matrix=layer - 1, level=niv,
+                                                 char_length=label_chars(), extended=False,
+                                                 first=1):
+                    if not _send(conn, proto.pack(data)):
+                        return n
+                    n += 1
             _published[cle] = set(tables.get((etage, role)) or {})
     return n
 
@@ -1026,9 +1112,14 @@ def _serve_client(conn, addr):
                     _send(conn, f)
                 with _lock:
                     _status["labels_sent"] += len(frames)
-                log.info("swp08: %s — %s matrice %d niveau %d (%s) → %d message(s)",
+                # La LARGEUR demandée et le jeu de commandes manquaient à cette ligne. Ce sont
+                # pourtant les deux seules choses qu'on ne peut pas deviner du contrôleur, et
+                # celles dont dépend le nommage sur plusieurs niveaux : savoir s'il réclame 4,
+                # 8 ou 12 caractères, et s'il passe par le jeu étendu.
+                log.info("swp08: %s — %s matrice %d niveau %d (%s) %d car.%s → %d message(s)",
                          addr, req["kind"], req["matrix"] + 1, req["level"] + 1,
-                         STAGE_LABELS.get(_stage_of(req["matrix"] + 1, req["level"] + 1), "?"), len(frames))
+                         STAGE_LABELS.get(_stage_of(req["matrix"] + 1, req["level"] + 1), "?"),
+                         req["char_length"], " étendu" if req.get("extended") else "", len(frames))
     finally:
         try:
             conn.close()
