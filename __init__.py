@@ -42,6 +42,7 @@ NOMS ne le sont pas : elles ne figurent dans aucune spec publique — l'Issue 4b
 est donc à confronter au banc, ce à quoi sert la prévisualisation hexadécimale commentée.
 """
 import logging
+import re
 import socket
 import threading
 import time
@@ -156,8 +157,16 @@ _status = {"running": False, "port": 0, "clients": 0, "last_error": None,
 # ═════════════════════════════════════════════════════════════════════
 
 def _int_setting(key, default, lo, hi):
+    # `settings.get(key) or default` confondait ZÉRO et ABSENT : 0 étant faux en Python, un
+    # réglage posé à 0 repartait silencieusement sur son défaut. Constaté en réglant
+    # `swp08_test_level` à 0 — le banc a poussé ses seize niveaux au lieu d'un seul, et rien
+    # dans le journal ne disait pourquoi. Un réglage qu'on écrit et qui ne s'applique pas est
+    # pire qu'un réglage absent : on cherche la panne ailleurs.
+    v = settings.get(key)
+    if v is None or v == "":
+        v = default
     try:
-        v = int(settings.get(key) or default)
+        v = int(v)
     except (TypeError, ValueError):
         v = default
     return max(lo, min(hi, v))
@@ -303,11 +312,33 @@ def _refus_mode():
     return v if v in REFUS_MODES else "tally"
 
 
-def test_matrix():
-    """Numéro de matrice servant le banc d'essai, ou 0 si le mode test est éteint."""
+def test_matrices():
+    """Matrices servant le banc d'essai, dans l'ordre déclaré. Vide si le mode test est éteint.
+
+    Le réglage accepte un entier (« 15 ») ou une LISTE (« 15,16 ») : éprouver ce qu'un contrôleur
+    fait de DEUX layers alimentés en même temps demande deux matrices vivantes à la fois, et une
+    valeur unique obligeait à basculer de l'une à l'autre — ce qui laisse la première rémanente
+    et rend la comparaison douteuse."""
     if not bool(settings.get("swp08_test")):
-        return 0
-    return _int_setting("swp08_test_matrix", 1, 1, 16)
+        return []
+    brut = settings.get("swp08_test_matrix")
+    morceaux = [m for m in re.split(r"[,;\s]+", str(brut or "")) if m]
+    out = []
+    for m in morceaux:
+        try:
+            v = int(m)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= v <= 16 and v not in out:
+            out.append(v)
+    return out or [1]
+
+
+def test_matrix():
+    """Première matrice du banc, ou 0 s'il est éteint. Conservé pour les appelants qui n'en
+    veulent qu'une (le repère du banc dans les libellés, par exemple)."""
+    mm = test_matrices()
+    return mm[0] if mm else 0
 
 
 def model(force=False):
@@ -533,8 +564,7 @@ def _stage_of(matrix_displayed, level_displayed=1):
 
     Une valeur hors plan retombe sur l'étage d'entrée plutôt que de ne rien rendre : un
     contrôleur qui explore ne doit pas conclure au silence."""
-    tm = test_matrix()
-    if tm and matrix_displayed == tm:
+    if matrix_displayed in test_matrices():
         return "test"          # le banc d'essai prime : c'est le but, isoler le protocole
     st = _STAGE_OF_LEVEL.get(matrix_displayed)
     if st is None and level_displayed != 1:
@@ -567,24 +597,25 @@ def test_level():
 def _test_labels(labels, req):
     """Libellés du banc qui DISENT leur propre origine.
 
-    « DEST12X 3 » se lit : table des DESTINATIONS, demandée en 12 caractères, jeu de commandes
-    ÉTENDU, signal 3. L'écran du contrôleur répond alors tout seul aux deux questions qu'on ne
-    peut pas trancher depuis le serveur — QUELLE table il affiche, et à QUELLE largeur il la
-    demande. Sans ça, trois tables qui renvoient la même chaîne sont indiscernables une fois
-    affichées, et l'on croit lire l'UMD alors qu'on lit les sources.
+    « DEST15 L01 3 » se lit : table des DESTINATIONS, matrice 15, niveau de libellé 1, signal 3
+    — et ça tient exactement dans les douze caractères du protocole. L'écran du contrôleur
+    répond alors tout seul aux questions qu'on ne peut pas trancher depuis le serveur : QUELLE
+    table il affiche, de QUELLE matrice, et à QUEL niveau il l'a rangée. Sans ça, deux layers
+    alimentés en parallèle rendent la même chaîne et l'on ne sait plus lequel on regarde.
 
-    C'est aussi la seule façon d'éprouver la piste « plusieurs niveaux de libellés » : si le
-    pupitre demande successivement 4, 8 et 12, il montrera trois chaînes différentes."""
+    La MATRICE est dans le libellé depuis qu'on éprouve deux bancs à la fois : c'est le seul
+    discriminant qui ne dépend pas de ce que le contrôleur veut bien nous dire."""
     kind = req["kind"] if req["kind"] in _TEST_CANAL else "source"
     w = req["char_length"]
     lvl = int(req.get("level") or 0) + 1        # base 1, comme au menu du contrôleur
+    mat = int(req.get("matrix") or 0) + 1
     court, moyen, long_ = _TEST_CANAL[kind]
-    if w <= 4:
-        motif = "%s%d%%d" % (court, lvl)
+    if w <= 4:                                  # place pour la matrice OU le niveau, pas les deux
+        motif = "%s%d%%d" % (court, mat)
     elif w <= 8:
-        motif = "%sL%02d %%d" % (moyen, lvl)
+        motif = "%s%dL%02d %%d" % (court, mat, lvl)
     else:
-        motif = "%s L%02d %%d" % (long_, lvl)
+        motif = "%s%d L%02d %%d" % (long_, mat, lvl)
     return {n: (motif % n)[:w] for n in labels}
 
 
@@ -678,9 +709,7 @@ def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
     # ce pupitre ne demande jamais rien (cf. ci-dessus), le banc était injoignable pour tout ce
     # qui touche au nommage. On l'ajoute à la tournée quand il est allumé — c'est la seule façon
     # de lui faire afficher quoi que ce soit.
-    tournee = list(LEVEL_PLAN)
-    if test_matrix():
-        tournee = tournee + [(test_matrix(), "test", None)]
+    tournee = list(LEVEL_PLAN) + [(m, "test", None) for m in test_matrices()]
     for layer, _stage, _ess in tournee:
         if matrices_wanted and layer not in matrices_wanted:
             continue
@@ -718,7 +747,8 @@ def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
                 niveaux = range(TEST_LABEL_LEVELS) if tl < 0 else (tl,)
             for niv in niveaux:
                 envoi = (_test_labels(labels, {"kind": kind, "char_length": label_chars(),
-                                               "extended": False, "level": niv})
+                                               "extended": False, "level": niv,
+                                               "matrix": layer - 1})
                          if etage == "test" else labels)
                 for data in proto.name_responses(kind, envoi, matrix=layer - 1, level=niv,
                                                  char_length=label_chars(), extended=False,
