@@ -93,7 +93,7 @@ LEVEL_PLAN = (
 ESSENCE_LABELS = {"video": "vidéo", "audio1": "audio 1", "audio2": "audio 2",
                   "anc": "ANC", None: "—"}
 STAGE_LABELS = {"in": "entrées", "out": "sorties", "assign": "affectation",
-                "test": "banc d'essai"}
+                "test": "banc d'essai", "vlan": "grille VLAN"}
 
 # Suffixe d'essence ajouté au libellé. RIEN pour la vidéo : c'est l'essence par défaut, celle
 # qu'on regarde neuf fois sur dix, et l'alourdir gaspillerait des caractères sur les douze que
@@ -310,6 +310,111 @@ OOR_SOURCE = 1023               # base 0 sur le fil, comme tout le reste du prot
 def _refus_mode():
     v = str(settings.get("swp08_refus_mode") or "").strip().lower()
     return v if v in REFUS_MODES else "tally"
+
+
+# ─── Grille VLAN : une matrice dédiée, alimentée par le plugin de pilotage ───
+# Le pilotage des VLAN du parc de switchs quitte la matrice Ember+ pour une matrice SW-P-08 :
+# Ember+ n'émet que des numéros, ce protocole porte des NOMS — et c'est tout ce qu'on lui
+# demande de plus. Le plan complet (ports, VLAN, tally, libellés déjà taillés à douze
+# caractères) vient du PLUGIN, seul à connaître le parc. Ce service ne retraduit rien : il
+# convertit en base 0, comble les destinations sans port réel, et encode.
+VLAN_TOOL = "switch_ports"
+VLAN_TTL_S = 10.0              # le plan se relit au plus toutes les 10 s ; le plugin le sert
+                               # depuis son propre cache de fond, donc sans I/O vers les switchs
+VLAN_SRC_SHUT = 1              # numéros AFFICHÉS ; miroir des constantes du plugin
+VLAN_SRC_TRUNK = 2
+VLAN_SRC_ABSENT = 3            # pseudo-source des destinations sans port réel
+VLAN_SRC_OFFSET = 10           # VLAN v → source affichée v + 10
+VLAN_PORTS_PAR_SLOT = 100
+_vlan_cache = {"ts": 0.0, "plan": None}
+_vlan_absente = False          # la grille a manqué la dernière construction du modèle
+
+
+def vlan_matrix():
+    """Matrice de la grille VLAN. **0 l'éteint** — le service se comporte alors exactement
+    comme avant, ce qui reste la sortie de secours si la grille dérange une exploitation."""
+    return _int_setting("swp08_vlan_matrix", 10, 0, 16)
+
+
+def vlan_slots():
+    """Slots DÉCLARÉS, donc taille de la grille. L'agrandir est sûr — on ajoute en fin ; la
+    réduire fait disparaître des libellés déjà câblés au contrôleur."""
+    return _int_setting("swp08_vlan_slots", 32, 1, 99)
+
+
+def vlan_max_vid():
+    """Plus haut VLAN déclaré. Figé une fois pour toutes : l'axe des sources ne doit jamais
+    changer de taille, sinon chaque switch ajouté redéclarerait la grille."""
+    return _int_setting("swp08_vlan_max_vid", 4094, 1, 4094)
+
+
+def _vlan_write_allowed(addr):
+    """Autorisation d'écrire sur la grille VLAN.
+
+    Liste PROPRE (`swp08_vlan_write_allow`) si elle est renseignée, sinon repli sur celle de
+    l'IPG. Commuter un VLAN sur le fabric n'a pas le même poids que router un signal, d'où la
+    liste séparée ; mais tant qu'on ne l'a pas remplie, hériter de la politique existante vaut
+    mieux qu'ouvrir en grand — `_write_allowed` traite une liste vide comme une absence de
+    restriction, et un réglage neuf ne doit pas élargir un accès en silence."""
+    raw = settings.get("swp08_vlan_write_allow") or ""
+    propre = {p.strip() for p in str(raw).replace(";", ",").split(",") if p.strip()}
+    if not propre:
+        return _write_allowed(addr)
+    return (addr[0] if isinstance(addr, (tuple, list)) else str(addr)) in propre
+
+
+def _vlan_plan(force=False):
+    """Plan rendu par le plugin, mémoïsé. ({}, motif) si le plugin ne répond pas.
+
+    On garde le DERNIER plan connu en cas d'échec plutôt que de vider la grille : une grille qui
+    disparaît du contrôleur casse une configuration, alors que des libellés d'une minute ne
+    coûtent rien."""
+    now = time.monotonic()
+    if not force and _vlan_cache["plan"] is not None and (now - _vlan_cache["ts"]) < VLAN_TTL_S:
+        return _vlan_cache["plan"], None
+    try:
+        st, data = tools.call(VLAN_TOOL, "swp08/grid", "GET", timeout=15)
+    except Exception as e:
+        return _vlan_cache["plan"] or {}, "plan indisponible : %s" % e
+    if st != 200 or not isinstance(data, dict):
+        return _vlan_cache["plan"] or {}, "plan refusé par %s (HTTP %s)" % (VLAN_TOOL, st)
+    _vlan_cache.update({"ts": now, "plan": data})
+    return data, None
+
+
+def _vlan_tables():
+    """{(«vlan», rôle): {numéro affiché: libellé}} + le tally. ({}, motif) si indisponible."""
+    plan, err = _vlan_plan()
+    if err and not plan:
+        return {}, err
+    vide = _fmt("swp08_unused_label", ".")
+    largeur = label_chars()
+    # ── Sources : gestes réservés, puis un VLAN par numéro, sur toute la plage déclarée ──
+    sources = {VLAN_SRC_SHUT: "SHUT", VLAN_SRC_TRUNK: "TRUNK", VLAN_SRC_ABSENT: "INEXISTANT"}
+    for n in range(VLAN_SRC_ABSENT + 1, VLAN_SRC_OFFSET + 1):
+        sources[n] = vide                      # bande réservée, place pour de futures actions
+    noms = {int(v["vid"]): (v.get("name") or "") for v in (plan.get("vlans") or [])
+            if str(v.get("vid", "")).isdigit()}
+    for vid in range(1, vlan_max_vid() + 1):
+        nom = noms.get(vid)
+        # « VID_Nom » : le VID d'abord parce que c'est lui qui discrimine, et qu'il est court.
+        # Un VLAN qu'aucun switch ne déclare garde son numéro seul — plus utile qu'un point,
+        # puisque la grille reste navigable.
+        sources[vid + VLAN_SRC_OFFSET] = ("%d_%s" % (vid, nom))[:largeur] if nom else str(vid)
+    # ── Destinations : la grille est RECTANGULAIRE, trous compris ──
+    ports = {int(p["n"]): p for p in (plan.get("ports") or []) if str(p.get("n", "")).isdigit()}
+    dest, tally = {}, {}
+    for n in range(VLAN_PORTS_PAR_SLOT, vlan_slots() * VLAN_PORTS_PAR_SLOT + VLAN_PORTS_PAR_SLOT):
+        p = ports.get(n)
+        if p is None:
+            dest[n] = vide
+            tally[n] = VLAN_SRC_ABSENT          # « Inexistant » : le trou se dit, il ne se tait pas
+            continue
+        dest[n] = str(p.get("label") or "")[:largeur] or vide
+        src = p.get("src")
+        if isinstance(src, int) and src >= 1:
+            tally[n] = src                      # sinon : port sans VLAN d'accès, laissé sans tally
+    return {("vlan", "source"): sources, ("vlan", "dest"): dest, ("vlan", "tally"): tally}, None
 
 
 def test_matrices():
@@ -549,6 +654,31 @@ def _build_model():
     # indiscernable du nom de source — donc intestable. Ici elle existe pour elle-même.
     out[("test", "umd")] = {n: "UMD %d" % n for n in range(1, TEST_SIZE + 1)}
     out[("test", "tally")] = dict(_test_tally)
+    # Grille VLAN : indépendante de l'IPG, et surtout NON BLOQUANTE. Si le plugin de pilotage
+    # ne répond pas, on perd sa grille — pas les huit autres. L'inverse n'est pas vrai
+    # aujourd'hui (une collecte IPG en échec sort plus haut, grille VLAN comprise) : c'est une
+    # dépendance à défaire quand la grille sera en service.
+    if vlan_matrix():
+        global _vlan_absente
+        try:
+            tv, everr = _vlan_tables()
+            if everr:
+                log.warning("swp08: grille VLAN indisponible : %s", everr)
+            out.update(tv)
+        except Exception as e:
+            log.warning("swp08: grille VLAN échouée : %s", e)
+            tv = {}
+        # Les libellés ne partent QU'À LA CONNEXION. Si le plugin redémarrait à cet instant —
+        # cas vécu : conteneur recréé, HTTP 502, grille absente de la poussée — le contrôleur
+        # restait sans grille VLAN jusqu'à sa prochaine reconnexion, c'est-à-dire indéfiniment.
+        # On repousse donc dès qu'elle réapparaît. (Le cache mémoire ne protège qu'APRÈS un
+        # premier succès ; le persister comme `emberplus_trees.json` reste à faire.)
+        if _vlan_absente and tv:
+            _vlan_absente = False
+            log.info("swp08: grille VLAN revenue — rediffusion des libellés")
+            threading.Thread(target=notify_change, daemon=True).start()
+        elif not tv:
+            _vlan_absente = True
     return out, None
 
 
@@ -566,6 +696,8 @@ def _stage_of(matrix_displayed, level_displayed=1):
     contrôleur qui explore ne doit pas conclure au silence."""
     if matrix_displayed in test_matrices():
         return "test"          # le banc d'essai prime : c'est le but, isoler le protocole
+    if vlan_matrix() and matrix_displayed == vlan_matrix():
+        return "vlan"
     st = _STAGE_OF_LEVEL.get(matrix_displayed)
     if st is None and level_displayed != 1:
         st = _STAGE_OF_LEVEL.get(level_displayed)
@@ -710,6 +842,8 @@ def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
     # qui touche au nommage. On l'ajoute à la tournée quand il est allumé — c'est la seule façon
     # de lui faire afficher quoi que ce soit.
     tournee = list(LEVEL_PLAN) + [(m, "test", None) for m in test_matrices()]
+    if vlan_matrix():
+        tournee = tournee + [(vlan_matrix(), "vlan", None)]
     for layer, _stage, _ess in tournee:
         if matrices_wanted and layer not in matrices_wanted:
             continue
@@ -881,8 +1015,11 @@ def _handle_routing(conn, addr, payload):
                 _send_tally(c, r["matrix"], r["level"], r["dest"],
                             r["source"] or 0, connected=True)
             return True
-        ok = _apply_assign(conn, addr, r, tal) if etage == "assign" \
-            else _apply_signal(conn, addr, r, tal)
+        if etage == "vlan":
+            ok = _apply_vlan(conn, addr, r, tal)
+        else:
+            ok = _apply_assign(conn, addr, r, tal) if etage == "assign" \
+                else _apply_signal(conn, addr, r, tal)
         if ok is False and _refus_mode() == "nak":
             return "nak"
         return True
@@ -902,6 +1039,49 @@ def _handle_routing(conn, addr, payload):
                  STAGE_LABELS.get(etage, "?"), envoyes, len(tal))
         return True
     return False
+
+
+def _apply_vlan(conn, addr, r, tal):
+    """Commute un VLAN d'accès depuis le contrôleur (matrice de la grille VLAN).
+
+    Le geste est renvoyé au PLUGIN, qui porte les garde-fous : port trunk verrouillé — c'est un
+    uplink, le commuter coupe le switch du réseau —, pseudo-sources non commutables, et VLAN
+    inconnu du switch refusé y compris quand la base VLAN n'a pas encore été lue. Ce dernier
+    refus est fail-closed à dessein : ne rien savoir n'est pas une autorisation.
+
+    Rien n'est retraduit ici. Le plugin a émis les numéros, il les relit ; une seconde
+    traduction serait une seconde vérité."""
+    t0 = time.monotonic()
+    dest, src = r["dest"] + 1, (r["source"] or 0) + 1      # le fil est en base 0 (§10.3)
+    if not _vlan_write_allowed(addr):
+        log.warning("swp08: %s — VLAN dest %d REFUSÉ : adresse non autorisée", addr, dest)
+        vrai = tal.get(dest)
+        if vrai is not None:
+            _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"], r["source"] or 0, vrai - 1)
+        return False
+    try:
+        st, rep = tools.call(VLAN_TOOL, "swp08/connect", "POST",
+                             {"target": dest, "source": src}, timeout=25)
+    except Exception as e:
+        log.warning("swp08: %s — VLAN dest %d ← src %d : appel échoué (%s)", addr, dest, src, e)
+        st, rep = 502, {"error": str(e)}
+    ok = (st == 200)
+    log.info("swp08: %s — VLAN dest %d ← src %d : %s", addr, dest, src,
+             "appliqué" if ok else "REFUSÉ (%s)" % (rep or {}).get("error", st))
+    if ok:
+        audit_log("swp08", "connect vlan", "dest %d ← src %d" % (dest, src),
+                  user_id=None, username=SWP08_ACTOR)
+        _vlan_plan(force=True)      # le tally suivant doit refléter l'écriture, pas l'attendre
+    # Le contrôleur affiche son crosspoint dès le clic. Un refus doit donc être démenti tout de
+    # suite, sinon l'opérateur croit que ça a marché — même règle que pour les signaux.
+    demande = r["source"] or 0
+    if ok:
+        reel = demande
+    else:
+        vrai = tal.get(dest)
+        reel = (vrai - 1) if vrai is not None else (VLAN_SRC_ABSENT - 1)
+    _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"], demande, reel)
+    return ok
 
 
 def _apply_signal(conn, addr, r, tal):

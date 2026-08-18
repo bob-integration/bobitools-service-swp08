@@ -2,7 +2,7 @@
   "license": "GPL-3.0-or-later",
   "id": "swp08",
   "label": "SW-P-08",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Serveur SW-P-08 (Pro-Bel « General Remote Control Protocol ») — publie le parc IPG sous forme de routeur : noms de sources, de destinations et libellés UMD, par matrice et par niveau. Les essences (vidéo, audio 1, audio 2, ANC) sont les NIVEAUX du protocole, ce qui évite les treize récepteurs qu'il aurait fallu en TSL. Nous sommes le routeur, le pupitre est le client : il se connecte, demande, on répond. Sans authentification → à filtrer au niveau réseau.",
   "settings_keys": {
     "swp08_enabled": {
@@ -96,6 +96,22 @@
     "swp08_dementi_ms": {
       "type": "int",
       "default": 600
+    },
+    "swp08_vlan_matrix": {
+      "type": "int",
+      "default": 10
+    },
+    "swp08_vlan_slots": {
+      "type": "int",
+      "default": 32
+    },
+    "swp08_vlan_max_vid": {
+      "type": "int",
+      "default": 4094
+    },
+    "swp08_vlan_write_allow": {
+      "type": "text",
+      "default": ""
     }
   }
 }
