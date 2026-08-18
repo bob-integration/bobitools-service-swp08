@@ -41,13 +41,15 @@ NOMS ne le sont pas : elles ne figurent dans aucune spec publique — l'Issue 4b
 « main commands » — et viennent du module Companion `generic-swp08`. Leur disposition exacte
 est donc à confronter au banc, ce à quoi sert la prévisualisation hexadécimale commentée.
 """
+import json
 import logging
+import os
 import re
 import socket
 import threading
 import time
 
-from app import settings, tools
+from app import config, settings, tools
 from app.database import audit_log
 from . import swp08 as proto
 
@@ -328,6 +330,40 @@ VLAN_SRC_OFFSET = 10           # VLAN v → source affichée v + 10
 VLAN_PORTS_PAR_SLOT = 100
 _vlan_cache = {"ts": 0.0, "plan": None}
 _vlan_absente = False          # la grille a manqué la dernière construction du modèle
+# Le cache mémoire ne protège qu'APRÈS un premier succès : redémarrer l'application pendant que
+# le plugin est indisponible faisait donc disparaître la grille du contrôleur — et c'est la
+# STRUCTURE qui casse une configuration de contrôleur, pas des libellés d'une minute. On persiste
+# donc le dernier plan connu, exactement comme le service Ember+ persiste ses sous-arbres bruts.
+# On garde la RÉPONSE BRUTE du plugin, pas les tables dérivées : c'est plus petit, et le
+# rechargement repasse par le même code que si le plugin venait de répondre.
+_VLAN_PLAN_FILE = os.path.join(os.path.dirname(config.DB_PATH), "swp08_vlan_plan.json")
+
+
+def _load_vlan_plan():
+    """Recharge le dernier plan persisté. Silencieux s'il n'y en a pas encore."""
+    try:
+        with open(_VLAN_PLAN_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log.warning("swp08: relecture de %s échouée : %s", _VLAN_PLAN_FILE, e)
+        return
+    if isinstance(d, dict) and d.get("ports") is not None:
+        _vlan_cache["plan"] = d
+        log.info("swp08: plan VLAN rechargé du disque (%d port(s))", len(d.get("ports") or []))
+
+
+def _save_vlan_plan(plan):
+    """Écrit le plan par remplacement atomique — un fichier tronqué par un arrêt brutal vaudrait
+    moins que pas de fichier du tout."""
+    try:
+        tmp = _VLAN_PLAN_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(plan, f, ensure_ascii=False)
+        os.replace(tmp, _VLAN_PLAN_FILE)
+    except Exception as e:
+        log.warning("swp08: écriture de %s échouée : %s", _VLAN_PLAN_FILE, e)
 
 
 def vlan_matrix():
@@ -378,7 +414,10 @@ def _vlan_plan(force=False):
         return _vlan_cache["plan"] or {}, "plan indisponible : %s" % e
     if st != 200 or not isinstance(data, dict):
         return _vlan_cache["plan"] or {}, "plan refusé par %s (HTTP %s)" % (VLAN_TOOL, st)
+    neuf = data != _vlan_cache.get("plan")
     _vlan_cache.update({"ts": now, "plan": data})
+    if neuf:
+        _save_vlan_plan(data)
     return data, None
 
 
@@ -1670,6 +1709,7 @@ def _prime():
 
 
 def boot():
+    _load_vlan_plan()          # avant tout client : une grille connue vaut mieux qu'une absente
     if bool(settings.get("swp08_enabled")):
         p = port()
         if p:
