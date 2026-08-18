@@ -538,7 +538,12 @@ def _build_model():
     global _contributor
     ipg_io, err = _ipg()
     if err:
-        return {}, err
+        # None, PAS un dict vide. `model()` sait servir le dernier bon modèle quand la
+        # construction échoue — mais son test est `tables is not None`, si bien qu'un `{}`
+        # ÉCRASAIT le cache au lieu de le préserver. Une simple indisponibilité de la couche
+        # IPG effaçait donc tout ce que le contrôleur affiche, grille VLAN comprise, alors que
+        # la protection existait et se croyait active.
+        return None, err
     try:
         state = ipg_io.collect()
         # Type d'outil qui porte la couche IPG, retenu pour lui renvoyer les affectations.
@@ -552,7 +557,7 @@ def _build_model():
             (d.get("type") for d in (state.get("devices") or {}).values() if d.get("type")),
             None)
     except Exception as e:
-        return {}, "collecte du parc échouée : %s" % e
+        return None, "collecte du parc échouée : %s" % e
 
     sig_fmt = _fmt("swp08_signal_format", "{short} {kind}{n}")
     lane_fmt = _fmt("swp08_lane_format", "{short} V{lane}")
