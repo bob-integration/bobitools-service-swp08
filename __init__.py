@@ -611,12 +611,35 @@ def _build_model():
             # essai réel du 2026-07-30.
             out.setdefault(("assign", "tally"), {})[slot] = ipg_io.DEV_SRC_OFFSET + n
         # Connecteurs : sources de l'étage d'entrée, destinations de l'étage de sortie.
+        #
+        # `{name}` = la désignation CONSTRUCTEUR du canal servi par ce connecteur (« C8 » sur un
+        # SNP), quand il en sert un. Ajouté le 2026-09-17 après un doute d'exploitation coûteux :
+        # le contrôleur affichait « SNP3 IP24 » pour un récepteur que le SNP, lui, nomme « C8 » —
+        # et qui n'a aucune entrée « 24 » à son écran. Le numéro 24 est le NÔTRE (le plan du
+        # §12.2), il ne se lit nulle part sur le matériel. L'exploitant a donc rapproché le
+        # multicast de la mauvaise ligne et conclu à une commutation fausse, alors qu'elle était
+        # juste. Un libellé qu'on ne peut pas recouper avec la face avant coûte un diagnostic.
+        #
+        # Le rapprochement se fait par l'INDEX : sur les familles où un connecteur IP sert la
+        # voie de même rang (le SNP), il rend le nom du canal ; ailleurs il rend le vide, et le
+        # gabarit n'affiche rien de plus qu'avant. On ne DEVINE pas une correspondance — on
+        # publie le nom seulement là où l'index en désigne un.
+        noms_voies = {int(k): (v or {}).get("name") or "" for k, v in (dev.get("lanes") or {}).items()}
         for sens, etage, role in (("inputs", "in", "source"), ("outputs", "out", "dest")):
             for s in dev.get(sens) or []:
                 num = ipg_io.phys_signal(slot, s["kind"], s["index"])
+                # Repli sur le NUMÉRO quand la famille ne nomme pas ses voies (un CDE ou un
+                # Newt n'ont pas de « C8 ») : c'est la même règle qu'au gabarit des voies, qui
+                # retombe sur « V<voie> ». Un `{name}` vide produirait « Régie IP » — un
+                # libellé qui a perdu son numéro sans rien gagner.
+                try:
+                    nom_canal = noms_voies.get(int(s["index"]), "") or str(s["index"])
+                except (TypeError, ValueError):
+                    nom_canal = ""
                 out[(etage, role)][num] = _format(
                     sig_fmt, short=court, slot=slot, kind=s["kind"].upper(),
-                    n=s["index"], index=num, label=s.get("label") or "", lane=0)
+                    n=s["index"], index=num, label=s.get("label") or "", lane=0,
+                    name=nom_canal)
         # Voies : destinations de l'étage d'entrée, sources de l'étage de sortie.
         for lane in sorted(dev.get("lanes") or {}):
             num = ipg_io.lane_signal(slot, lane)
