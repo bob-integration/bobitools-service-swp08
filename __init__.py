@@ -107,22 +107,57 @@ STAGE_LABELS = {"in": "entrées", "out": "sorties", "assign": "affectation",
 # en audio 2, franchement trompeur. Et pas « Audio1 » non plus : six caractères sur douze
 # mangent le nom du canal, si bien que les 32 voies d'un SNP se liraient toutes « SNP1 Audio1 ».
 # Trois caractères sont le point d'équilibre — mesuré, pas supposé.
-ESSENCE_SUFFIX = {"video": "", "audio1": "AU1", "audio2": "AU2", "anc": "ANC", None: ""}
+# Suffixe d'essence accolé au libellé, SANS espace (§28). Il valait « AU1 » / « AU2 » / « ANC »
+# précédé d'un espace, soit quatre caractères pris sur douze : le nom du canal était alors
+# tronqué et c'est LUI qui disparaissait — « SF1 IP A1 » devenait « SF1 IP AU1 », identique pour
+# les trente-deux canaux du châssis. Mesuré le 2026-09-18 : 864 libellés tronqués.
+# Deux caractères collés suffisent à distinguer les layers, et laissent le nom intact :
+# 0 tronqué, 0 collision sur tout le parc.
+ESSENCE_SUFFIX = {"video": "", "audio1": "_1", "audio2": "_2", "anc": "_A", None: ""}
+
+
+def _compacter(v, place):
+    """Retire des espaces, du DERNIER vers le premier, jusqu'à tenir dans `place` (§28).
+
+    Un espace se sacrifie avant une information : « SNP1 SDI A1 » devient « SNP1 SDIA1 » puis,
+    s'il le faut, « SNP1SDIA1 » — le châssis, le type et le canal restent tous lisibles, alors
+    que tronquer supprimait le canal et rendait trente-deux signaux identiques.
+
+    Du dernier espace vers le premier, parce que celui qui sépare le châssis du reste est le
+    plus utile à l'œil : on le garde le plus longtemps possible.
+
+    ⚠ ADAPTATIF, et c'est ce qui épargne la vidéo : un libellé qui tient déjà n'est pas touché.
+    Les voies (« SNP1 A1 », sept caractères) gardent donc leur espace, et le niveau vidéo, qui
+    n'a pas de suffixe, ne passe même pas par ici."""
+    while len(v) > place and " " in v.strip():
+        i = v.rstrip().rfind(" ")
+        if i <= 0:
+            break
+        v = v[:i] + v[i + 1:]
+    return v
 
 
 def _suffixe(labels, essence, largeur):
     """Ajoute le suffixe d'essence à un jeu de libellés, en tenant dans la largeur imposée.
-    On tronque le NOM et jamais le suffixe : perdre le suffixe rendrait deux layers
-    indiscernables, alors qu'un nom raccourci reste lisible."""
+
+    ORDRE DES SACRIFICES (§28), établi sur mesure le 2026-09-18 : on retire d'abord des
+    ESPACES (`_compacter`), et on ne tronque le NOM qu'en dernier recours. Le suffixe, lui,
+    n'est jamais amputé — le perdre rendrait deux layers indiscernables.
+
+    L'ancien ordre tronquait d'emblée : « SNP1 IP A1 » + « AU1 » donnait « SNP1 IP AU1 »,
+    identique pour les trente-deux canaux du châssis. 8 400 doublons mesurés sur le parc."""
     suf = ESSENCE_SUFFIX.get(essence) or ""
     if not suf:
         return labels
-    garde = largeur - len(suf) - 1
+    garde = largeur - len(suf)          # accolé : pas d'espace à réserver
     # Les PSEUDO-signaux (bloc bas, 1..99 : « Disconnect », « Mire ») ne portent pas d'essence
     # — ce sont des gestes, pas des flux. Les suffixer les tronquerait pour rien : le protocole
     # ne laisse que douze caractères, et « Disconnec A1 » ne dit rien de plus que « Disconnect ».
-    return {n: (v if (n < 100 or not v)
-                else "%s %s" % (str(v)[:garde].rstrip(), suf))
+    # Le marqueur « position inexistante » n'est pas un signal : le suffixer donnerait « ._1 »,
+    # qui ne dit rien de plus et occupe l'œil. Il reste tel quel sur tous les niveaux.
+    vide = _fmt("swp08_unused_label", ".")
+    return {n: (v if (n < 100 or not v or v == vide)
+                else "%s%s" % (_compacter(str(v), garde)[:garde].rstrip(), suf))
             for n, v in labels.items()}
 
 # niveau AFFICHÉ (base 1) → étage
@@ -144,6 +179,25 @@ _CANON_OF_LEVEL = {
     7: ("anc_in", 0), 8: ("anc_out", 0),
 }
 DEFAULT_STAGE = "in"        # un niveau hors plan retombe sur l'étage d'entrée
+
+
+def _tally_of(tables, layer, etage=None):
+    """Table de croisements À SERVIR pour ce layer : celle de SON essence (§27).
+
+    Une table par essence est bâtie depuis le 0.6.0. Celle de la VIDÉO reste publiée sous la
+    clé historique `(étage, "tally")`, qui sert de repli — pour un niveau hors plan, pour
+    l'affectation, et pour tout appelant qui n'aurait pas été converti.
+
+    Sans ça, les quatre niveaux d'un étage partageaient la table VIDÉO : un crosspoint audio
+    était confirmé au clic par le CONNECTED, puis démenti par la rediffusion suivante, qui
+    réémettait la source vidéo de la voie."""
+    etage = etage or _stage_of(layer)
+    ess = _ESSENCE_OF_LEVEL.get(layer)
+    if ess:
+        t = tables.get((etage, "tally", ess))
+        if t is not None:
+            return t
+    return tables.get((etage, "tally")) or {}
 
 _lock = threading.Lock()
 _sock = None
@@ -652,33 +706,49 @@ def _build_model():
                           index=num, kind="V", n=lane, label="")
             out[("in", "dest")][num] = lbl
             out[("out", "source")][num] = lbl
-            # ── Tally : QUI alimente cette voie ────────────────────────────────
+            # ── Tally : QUI alimente cette voie, PAR ESSENCE ───────────────────
             # L'état vient du matériel via `ember/io` — on ne l'invente pas. Une voie sans
             # source (« Désactivé ») reste absente du tally plutôt que d'être routée sur un
             # signal 0 qui existerait : le pupitre doit voir un point de croisement vide,
             # pas un faux.
-            blk = ((dev["lanes"][lane].get("in") or {}).get(ipg_io.ESSENCE_VIDEO) or {})
-            src = blk.get("src")
-            if isinstance(src, dict) and src.get("kind") in ("sdi", "ip"):
+            #
+            # ⚠ UNE TABLE PAR ESSENCE (§27). Elle n'en avait qu'une, bâtie sur la seule VIDÉO
+            # et servie aux QUATRE niveaux de l'étage (`LEVEL_PLAN` : vidéo, audio 1, audio 2,
+            # ANC). Un crosspoint audio était donc confirmé au clic par le CONNECTED, puis
+            # DÉMENTI quelques secondes plus tard par la rediffusion, qui réémettait la source
+            # VIDÉO de la voie. Le défaut n'avait jamais mordu — 156 crosspoints en deux mois,
+            # tous sur `video_in` — mais il était armé.
+            for _ess in ipg_io.ESSENCES:
+                _blk = ((dev["lanes"][lane].get("in") or {}).get(_ess) or {})
+                _src = _blk.get("src")
+                if not (isinstance(_src, dict) and _src.get("kind") in ("sdi", "ip")):
+                    continue
                 try:
-                    out.setdefault(("in", "tally"), {})[num] = ipg_io.phys_signal(
-                        slot, src["kind"], int(src["index"]))
+                    _n = ipg_io.phys_signal(slot, _src["kind"], int(_src["index"]))
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                out.setdefault(("in", "tally", _ess), {})[num] = _n
+                if _ess == ipg_io.ESSENCE_VIDEO:
+                    # Table historique, gardée telle quelle : elle reste le repli d'un niveau
+                    # dont l'essence n'a pas de table propre, et de tout appelant non converti.
+                    out.setdefault(("in", "tally"), {})[num] = _n
             # ── Étage de SORTIE : quelle voie alimente quel connecteur ──────────────────
             # Le sens s'inverse : ici la voie est la SOURCE et le connecteur la destination.
             # Sur la plupart des familles ces points sont épinglés (le programme d'un SNP
             # alimente en permanence son BNC et son Tx), mais épinglé ne veut pas dire absent :
             # sans ce tally, les quatre layers de sortie restaient vides au pupitre.
-            oblk = ((dev["lanes"][lane].get("out") or {}).get(ipg_io.ESSENCE_VIDEO) or {})
-            for dst in (oblk.get("dst") or []):
-                if not isinstance(dst, dict) or dst.get("kind") not in ("sdi", "ip"):
-                    continue
-                try:
-                    out.setdefault(("out", "tally"), {})[
-                        ipg_io.phys_signal(slot, dst["kind"], int(dst["index"]))] = num
-                except (TypeError, ValueError):
-                    pass
+            for _ess in ipg_io.ESSENCES:
+                _oblk = ((dev["lanes"][lane].get("out") or {}).get(_ess) or {})
+                for dst in (_oblk.get("dst") or []):
+                    if not isinstance(dst, dict) or dst.get("kind") not in ("sdi", "ip"):
+                        continue
+                    try:
+                        _n = ipg_io.phys_signal(slot, dst["kind"], int(dst["index"]))
+                    except (TypeError, ValueError):
+                        continue
+                    out.setdefault(("out", "tally", _ess), {})[_n] = num
+                    if _ess == ipg_io.ESSENCE_VIDEO:
+                        out.setdefault(("out", "tally"), {})[_n] = num
     # ── Grille d'affectation : PLEINE, comme celle d'Ember+ (§12.7) ───────────────────────
     # Tous les slots émis figurent en destinations, occupés ou non, et TOUS les matériels
     # connus en sources, posés ou non. N'y mettre que l'affecté avait deux conséquences que le
@@ -1042,7 +1112,7 @@ def _handle_routing(conn, addr, payload):
         log.warning("swp08: %s — état indisponible : %s", addr, err)
         return True
     etage = _stage_of(r["matrix"] + 1, r["level"] + 1)
-    tal = tables.get((etage, "tally")) or {}
+    tal = _tally_of(tables, r["matrix"] + 1, etage)
     if r["kind"] == "interrogate":
         src = tal.get(r["dest"] + 1)          # base 0 sur le fil
         if src is None:
@@ -1583,7 +1653,7 @@ def _notify_once():
     envoyes = 0
     for layer, stage, _ess in LEVEL_PLAN:
         etage = _stage_of(layer)
-        apres = tables.get((etage, "tally")) or {}
+        apres = _tally_of(tables, layer, etage)
         nouveau[layer] = dict(apres)
         avant = _last_assign.get(layer) or {}
         for dest in sorted(set(avant) | set(apres)):
@@ -1730,7 +1800,7 @@ def _prime():
     tables, err = model(force=True)
     if err:
         return
-    _last_assign = {layer: dict(tables.get((_stage_of(layer), "tally")) or {})
+    _last_assign = {layer: dict(_tally_of(tables, layer))
                     for layer, _st, _e in LEVEL_PLAN}
     log.info("swp08: modèle préchauffé, repère des croisements amorcé (%d layer(s))",
              len(_last_assign))
