@@ -160,6 +160,30 @@ def _suffixe(labels, essence, largeur):
                 else "%s%s" % (_compacter(str(v), garde)[:garde].rstrip(), suf))
             for n, v in labels.items()}
 
+def _grille_audio(labels, largeur):
+    """Liste de sources d'un layer audio : la grille ENTIÈRE, les DEUX essences (§12.10).
+
+    La grille audio est commune à l'audio 1 et à l'audio 2 — c'est ce qui permet de croiser
+    l'un dans l'autre — et c'est le NUMÉRO qui porte l'essence : `base` pour l'audio 1,
+    `base + 10000` pour l'audio 2. N'en publier que la moitié basse rendait l'autre invisible
+    au contrôleur : le croisement passait sur le fil mais était impossible à DÉSIGNER.
+
+    Mesuré le 2026-09-19 sur le Neuron : `audio_in dest 516 ← src 10517` s'applique, et
+    jusqu'au canal (l'essence de la source décale la base de `flow` canaux dans le routeur
+    audio du châssis) — alors qu'aucun libellé n'existait au-delà de 10000.
+
+    Le suffixe suit donc la PLAGE du numéro, et non le layer : sur les deux layers audio,
+    `517` se lit « _1 » et `10517` se lit « _2 ». Les pseudo-signaux du bloc bas
+    (« Disconnect », « Mire ») n'ont pas de moitié haute : ce sont des gestes, pas des flux."""
+    ipg_io, err = _ipg()
+    if err:
+        return _suffixe(labels, "audio1", largeur)
+    out = _suffixe(labels, "audio1", largeur)
+    out.update({n + ipg_io.AUDIO2_OFFSET: v
+                for n, v in _suffixe(labels, "audio2", largeur).items() if n >= 100})
+    return out
+
+
 # niveau AFFICHÉ (base 1) → étage
 _STAGE_OF_LEVEL = {lvl: stage for lvl, stage, _ in LEVEL_PLAN}
 _ESSENCE_OF_LEVEL = {lvl: ess for lvl, _st, ess in LEVEL_PLAN}
@@ -679,17 +703,48 @@ def _build_model():
         # gabarit n'affiche rien de plus qu'avant. On ne DEVINE pas une correspondance — on
         # publie le nom seulement là où l'index en désigne un.
         noms_voies = {int(k): (v or {}).get("name") or "" for k, v in (dev.get("lanes") or {}).items()}
+        # Quelle VOIE alimente ce connecteur de SORTIE (§30) ? La relation est publiée dans
+        # `out.dst` ; on ne la devine pas. Un connecteur alimenté par PLUSIEURS voies, ou par
+        # aucune, reste nommé par son index — on ne tranche pas une ambiguïté.
+        par_sortie = {}
+        for _ln, _l in (dev.get("lanes") or {}).items():
+            for _d in ((((_l.get("out") or {}).get(ipg_io.ESSENCE_VIDEO)) or {}).get("dst") or []):
+                if isinstance(_d, dict) and _d.get("kind") in ("sdi", "ip"):
+                    try:
+                        par_sortie.setdefault((_d["kind"], int(_d["index"])), []).append(int(_ln))
+                    except (TypeError, ValueError):
+                        pass
         for sens, etage, role in (("inputs", "in", "source"), ("outputs", "out", "dest")):
             for s in dev.get(sens) or []:
                 num = ipg_io.phys_signal(slot, s["kind"], s["index"])
-                # Repli sur le NUMÉRO quand la famille ne nomme pas ses voies (un CDE ou un
-                # Newt n'ont pas de « C8 ») : c'est la même règle qu'au gabarit des voies, qui
-                # retombe sur « V<voie> ». Un `{name}` vide produirait « Régie IP » — un
-                # libellé qui a perdu son numéro sans rien gagner.
+                # ENTRÉE : le connecteur est nommé par la voie de MÊME index. C'est une
+                # supposition, mais la seule STABLE — `in.src` ne dit que la source choisie à
+                # l'instant t, si bien qu'un nommage par la relation ferait changer le libellé
+                # à chaque commutation, et laisserait sans nom tout connecteur non sélectionné.
+                # Mesuré le 2026-09-17 : 199 bons libellés détruits. Cf. §30.
+                #
+                # SORTIE : la relation, elle, est ÉPINGLÉE — `out.dst` dit quelle voie alimente
+                # ce connecteur, et ça ne bouge pas. On l'emploie donc, et c'est ce qui corrige
+                # le Neuron, dont les seize sorties IP portent les voies 17 à 32 (E1..H4) et
+                # s'annonçaient « ND IP A1 »..« ND IP D4 ».
+                #
+                # Repli commun sur le NUMÉRO quand la famille ne nomme pas ses voies (un CDE ou
+                # un Newt n'ont pas de « C8 »), comme le gabarit des voies retombe sur « V<n> ».
                 try:
-                    nom_canal = noms_voies.get(int(s["index"]), "") or str(s["index"])
+                    _i = int(s["index"])
                 except (TypeError, ValueError):
-                    nom_canal = ""
+                    _i = None
+                # ⚠ SORTIES **IP** SEULEMENT. Mesuré : étendre la règle aux sorties SDI
+                # fabrique 32 doublons sur le Neuron, dont une voie alimente DEUX connecteurs
+                # (voie 1 → SDI 1 ET SDI 17, tous deux nommés « ND SDI A1 »). La relation est
+                # vraie, mais elle ne discrimine pas — l'index, lui, garde les deux distincts.
+                # Les sorties IP, elles, sont une par voie : la relation y est sans ambiguïté.
+                if sens == "outputs" and s.get("kind") == "ip":
+                    _voies = par_sortie.get(("ip", _i)) or []
+                    nom_canal = (noms_voies.get(_voies[0]) or "") if len(_voies) == 1 else ""
+                else:
+                    nom_canal = noms_voies.get(_i, "") if _i is not None else ""
+                nom_canal = nom_canal or (str(_i) if _i is not None else "")
                 out[(etage, role)][num] = _format(
                     sig_fmt, short=court, slot=slot, kind=s["kind"].upper(),
                     n=s["index"], index=num, label=s.get("label") or "", lane=0,
@@ -727,6 +782,15 @@ def _build_model():
                     _n = ipg_io.phys_signal(slot, _src["kind"], int(_src["index"]))
                 except (TypeError, ValueError):
                     continue
+                # La source porte SON essence (§12.10) : une voie audio 1 alimentée par
+                # l'audio 2 d'un connecteur doit se confirmer en `base + 10000`, sinon le
+                # contrôleur affiche l'autre moitié de la grille et dément un croisement
+                # qui a pourtant eu lieu. Un contributeur qui ne déclare pas l'essence de
+                # sa source — les SNP, qui ne routent aucun audio au niveau des voies —
+                # garde le numéro de base, c'est-à-dire l'essence du layer : le comportement
+                # historique, inchangé.
+                if _src.get("essence") == "audio2":
+                    _n += ipg_io.AUDIO2_OFFSET
                 out.setdefault(("in", "tally", _ess), {})[num] = _n
                 if _ess == ipg_io.ESSENCE_VIDEO:
                     # Table historique, gardée telle quelle : elle reste le repli d'un niveau
@@ -992,9 +1056,16 @@ def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
         if tables.get((etage, "umd")):
             canaux = canaux + (("umd", "umd"),)
         for kind, role in canaux:
-            labels = _suffixe(dict(tables.get((etage, role)) or {}),
-                              _ESSENCE_OF_LEVEL.get(layer), label_chars())
+            brut = dict(tables.get((etage, role)) or {})
+            _ess = _ESSENCE_OF_LEVEL.get(layer)
+            # Sur un layer audio, la liste des SOURCES est la grille entière (cf.
+            # `_grille_audio`) : sans elle, la moitié audio 2 n'a aucun libellé et le
+            # croisement, pourtant applicable, reste indésignable.
+            labels = (_grille_audio(brut, label_chars())
+                      if role == "source" and _ess in ("audio1", "audio2")
+                      else _suffixe(brut, _ess, label_chars()))
             cle = (layer, kind)
+            publies = set(labels)
             if clear_stale:
                 # Un matériel qui rétrécit ou s'en va laisse des numéros ORPHELINS : le SNP et
                 # ses 32 voies remplacé par un CDE et ses 4, ce sont les voies 5 à 32 qui
@@ -1027,7 +1098,10 @@ def push_names(conn, tables=None, matrices_wanted=None, clear_stale=False):
                     if not _send(conn, proto.pack(data)):
                         return n
                     n += 1
-            _published[cle] = set(tables.get((etage, role)) or {})
+            # Ce qu'on a RÉELLEMENT publié, pas les clés de la table : la moitié haute
+            # d'un layer audio n'existe pas dans la table source, et sans cela le nettoyage
+            # des orphelins ne la verrait jamais partir.
+            _published[cle] = publies
     return n
 
 
@@ -1260,8 +1334,16 @@ def _apply_signal(conn, addr, r, tal):
     if not state:
         log.info("swp08: %s — état du parc vide, commutation ignorée", addr)
         return True
+    # Le décalage ne vaut que pour la DESTINATION : c'est le layer qui dit de quel audio
+    # elle est. La SOURCE, elle, porte son essence dans son propre numéro (§12.10) — la
+    # décaler une seconde fois était une seconde vérité, avec deux conséquences mesurées le
+    # 2026-09-19 : depuis le layer audio 2 une source `517` devenait `20517`, slot 205
+    # inexistant, donc le croisement audio 1 → audio 2 était refusé « hors plan » alors
+    # qu'il s'applique parfaitement depuis le layer audio 1 ; et « Disconnect », qui est un
+    # pseudo-signal du bloc bas sans essence, subissait le même sort — on ne pouvait donc
+    # pas déconnecter sur ce layer.
     tgt = r["dest"] + dec
-    src = [(r["source"] or 0) + dec]
+    src = [(r["source"] or 0)]
     try:
         ok, touche = ipg_io.apply_connect(canon, tgt, src, "connect", state)
     except Exception as e:
