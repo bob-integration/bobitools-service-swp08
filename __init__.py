@@ -1271,8 +1271,12 @@ def _apply_vlan(conn, addr, r, tal):
             _answer_xpt(conn, t0, r["matrix"], r["level"], r["dest"], r["source"] or 0, vrai - 1)
         return False
     try:
+        from app import droits
+        # Le contrôleur est un APPELANT : le cœur applique les règles de périmètre de l'outil
+        # (Réglages → Outils → Périmètres) au port visé, comme pour un utilisateur.
         st, rep = tools.call(VLAN_TOOL, "swp08/connect", "POST",
-                             {"target": dest, "source": src}, timeout=25)
+                             {"target": dest, "source": src}, timeout=25,
+                             principal=droits.who_controller(addr, "swp08"))
     except Exception as e:
         log.warning("swp08: %s — VLAN dest %d ← src %d : appel échoué (%s)", addr, dest, src, e)
         st, rep = 502, {"error": str(e)}
