@@ -714,6 +714,27 @@ def _build_model():
                         par_sortie.setdefault((_d["kind"], int(_d["index"])), []).append(int(_ln))
                     except (TypeError, ValueError):
                         pass
+        # Quelle VOIE un connecteur d'ENTRÉE alimente-t-il, quand c'est CÂBLÉ ? Seule une voie
+        # dont l'entrée est FIXE (`in.fixed`) et ne peut venir que de ce connecteur le dit sans
+        # ambiguïté : sur un CDE 1922, Rx 1 alimente la voie 3 et Rx 2 la voie 4. La règle « voie
+        # de même index » les nommait « IP 1 » et « IP 2 », ce qui se lisait au contrôleur comme
+        # les voies 1 et 2 — celles des émetteurs (signalé par l'exploitant le 2026-10-22). Une
+        # entrée COMMUTABLE (SNP, Neuron) n'entre pas ici : la relation y change à chaque
+        # commutation, et le §30 garde pour elle la règle de l'index.
+        par_entree = {}
+        for _ln, _l in (dev.get("lanes") or {}).items():
+            _b = ((_l.get("in") or {}).get(ipg_io.ESSENCE_VIDEO)) or {}
+            _src = _b.get("src")
+            if not (_b.get("fixed") and isinstance(_src, dict) and _src.get("kind") == "ip"):
+                continue
+            _autres = [a for a in (_b.get("allowed") or []) if isinstance(a, dict)
+                       and (a.get("kind"), str(a.get("index"))) != ("ip", str(_src.get("index")))]
+            if _autres:
+                continue
+            try:
+                par_entree.setdefault(int(_src["index"]), []).append(int(_ln))
+            except (TypeError, ValueError):
+                pass
         for sens, etage, role in (("inputs", "in", "source"), ("outputs", "out", "dest")):
             for s in dev.get(sens) or []:
                 num = ipg_io.phys_signal(slot, s["kind"], s["index"])
@@ -742,6 +763,11 @@ def _build_model():
                 if sens == "outputs" and s.get("kind") == "ip":
                     _voies = par_sortie.get(("ip", _i)) or []
                     nom_canal = (noms_voies.get(_voies[0]) or "") if len(_voies) == 1 else ""
+                elif sens == "inputs" and s.get("kind") == "ip" and len(par_entree.get(_i) or []) == 1:
+                    # Récepteur câblé sur UNE voie fixe : nommé par cette voie (nom constructeur,
+                    # sinon son numéro). Le gabarit ne change pas, seul `{name}` suit la voie.
+                    _v = par_entree[_i][0]
+                    nom_canal = noms_voies.get(_v) or str(_v)
                 else:
                     nom_canal = noms_voies.get(_i, "") if _i is not None else ""
                 nom_canal = nom_canal or (str(_i) if _i is not None else "")
